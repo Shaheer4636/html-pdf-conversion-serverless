@@ -1,6 +1,6 @@
 boto3
 
-# WeasyPrint stack (pin to avoid the PDF.__init__ mismatch)
+# WeasyPrint stack (pins prevent the PDF.__init__ mismatch)
 weasyprint==61.2
 pydyf==0.11.0
 tinycss2==1.2.1
