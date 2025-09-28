@@ -10,7 +10,7 @@ def _env(name, default=""):
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else v
 
-# --------- config (env overrides) ----------
+# --------- config (env overrides) -----
 BUCKET_NAME_SRC = _env("SRC_BUCKET", "lambda-output-report-000000987123")
 DEST_BUCKET     = _env("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX     = _env("BASE_PREFIX", "uptime")
