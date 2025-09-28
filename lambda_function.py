@@ -1,15 +1,9 @@
-# lambda_function.py
-import json
-import fnmatch
-import os
-import glob
-import subprocess
+import json, fnmatch, os
 from datetime import datetime, timezone, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
 
-# ---------- configuration (env overrides) ----------
 def _env(name, default=""):
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else v
@@ -22,30 +16,28 @@ SRC_FILE_NAME   = "uptime-report.html"
 OUT_HTML_NAME   = "uptime-report.html"
 OUT_PDF_NAME    = "uptime-report.pdf"
 
-ALLOW_PDF_SKIP  = _env("ALLOW_PDF_SKIP", "false").lower() in ("1", "true", "yes")
-DEBUG_DEFAULT   = _env("DEBUG_DEFAULT", "false").lower() in ("1", "true", "yes")
+ALLOW_PDF_SKIP  = _env("ALLOW_PDF_SKIP", "false").lower() in ("1","true","yes")
+DEBUG_DEFAULT   = _env("DEBUG_DEFAULT", "false").lower() in ("1","true","yes")
 
 AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
-PLAYWRIGHT_BROWSERS_PATH = _env("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
 
-# CLI rendering limits
-CHROME_TIMEOUT_SEC = int(_env("CHROME_TIMEOUT_SEC", "90"))   # hard timeout for the chromium process
-# ---------------------------------------------------
+# Playwright tuning
+PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "domcontentloaded")
+PW_STEP_TIMEOUT_MS = int(_env("PW_STEP_TIMEOUT_MS", "20000"))
+PLAYWRIGHT_BROWSERS_PATH = _env("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
 
 s3 = boto3.client("s3")
 
-
 def handler(event, context):
     debug = _get_debug(event)
-
     try:
-        month_str, year_str = _resolve_month_year(event)
+        m, y = _resolve_month_year(event)
     except ValueError as ve:
         return _error(400, str(ve))
 
-    prefix = f"{BASE_PREFIX}/{year_str}/{month_str}/"
+    prefix = f"{BASE_PREFIX}/{y}/{m}/"
     status = {
-        "month": month_str, "year": year_str,
+        "month": m, "year": y,
         "src_bucket": BUCKET_NAME_SRC, "dest_bucket": DEST_BUCKET,
         "src_prefix": prefix, "dest_prefix": prefix,
         "html_uploaded": False, "pdf_uploaded": False
@@ -53,16 +45,12 @@ def handler(event, context):
 
     try:
         _log_cfg()
-        _assert_bucket_exists(BUCKET_NAME_SRC, label="source")
+        _assert_bucket_exists(BUCKET_NAME_SRC, "source")
         _ensure_dest_bucket_exists(DEST_BUCKET)
-    except RuntimeError as e:
-        return _error(404, str(e))
 
-    try:
-        # 1) Find newest report html
         latest = _find_latest_report(BUCKET_NAME_SRC, prefix)
         if latest is None:
-            return _error(404, f'No "{SRC_FILE_NAME}" found under s3://{BUCKET_NAME_SRC}/{prefix} (including subfolders).')
+            return _error(404, f'No "{SRC_FILE_NAME}" under s3://{BUCKET_NAME_SRC}/{prefix}')
 
         key = latest["Key"]
         status["src_key"] = key
@@ -71,212 +59,123 @@ def handler(event, context):
         obj = s3.get_object(Bucket=BUCKET_NAME_SRC, Key=key)
         html = obj["Body"].read().decode("utf-8", errors="replace")
 
-        # 2) Store HTML copy in destination
-        _upload_html_copy(html, year_str, month_str)
+        _upload_html_copy(html, y, m)
         status["html_uploaded"] = True
 
-        # 3) Render PDF via Chromium CLI (no Playwright event loop)
         try:
-            _render_pdf_with_chromium_cli_and_upload(html, year_str, month_str)
+            _render_and_upload_pdf_playwright(html, y, m)
             status["pdf_uploaded"] = True
         except Exception as e:
             status["pdf_error"] = str(e)
             if not ALLOW_PDF_SKIP:
                 return _error(500, f"PDF generation failed: {e}")
 
-        # 4) Return
         if debug:
-            return {
-                "statusCode": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps(status)
-            }
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
-            "body": html
-        }
+            return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(status)}
+        return {"statusCode": 200, "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}, "body": html}
 
     except ClientError as e:
-        msg = e.response.get("Error", {}).get("Message", str(e))
-        return _error(500, f"S3 error: {msg}")
+        return _error(500, f"S3 error: {e.response.get('Error', {}).get('Message', str(e))}")
     except Exception as e:
         return _error(500, f"Unhandled error: {str(e)}")
-
 
 def lambda_handler(event, context):
     return handler(event, context)
 
-
-# ---------------- helpers ----------------
+# ---------- helpers ----------
 
 def _get_debug(event):
-    debug = DEBUG_DEFAULT
+    d = DEBUG_DEFAULT
     if isinstance(event, dict):
         qs = event.get("queryStringParameters") or {}
-        debug_val = (qs.get("debug") or event.get("debug") or "")
-        debug = str(debug_val).lower() in ("1", "true")
-    return debug
-
+        val = (qs.get("debug") or event.get("debug") or "")
+        d = str(val).lower() in ("1","true")
+    return d
 
 def _resolve_month_year(event):
-    event = event or {}
-    qs = event.get("queryStringParameters") or {}
-
-    def _get(key):
-        v = qs.get(key)
-        if v is None and isinstance(event, dict):
-            v = event.get(key)
+    event = event or {}; qs = event.get("queryStringParameters") or {}
+    def _get(k):
+        v = qs.get(k); 
+        if v is None and isinstance(event, dict): v = event.get(k)
         return (v or "").strip() if isinstance(v, str) else v
 
     month = (_get("month") or "auto").lower()
     year  = _get("year")
-
     now = datetime.now(timezone.utc)
-    if month in ("auto", ""):
-        use_dt = now
-    elif month in ("prev", "previous", "last"):
-        first_of_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        use_dt = first_of_this - timedelta(days=1)
+
+    if month in ("auto",""): use_dt = now
+    elif month in ("prev","previous","last"):
+        use_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
     else:
         if not str(month).isdigit() or not (1 <= int(month) <= 12):
             raise ValueError('Invalid "month". Use two digits like "09", or "auto", or "prev".')
         y = int(year) if year else now.year
         use_dt = datetime(y, int(month), 1, tzinfo=timezone.utc)
 
-    if not year:
-        year = str(use_dt.year)
-
-    month_str = f"{use_dt.month:02d}" if month in ("auto", "prev", "previous", "last", "") else f"{int(month):02d}"
-    return month_str, year
-
+    if not year: year = str(use_dt.year)
+    m = f"{use_dt.month:02d}" if month in ("auto","prev","previous","last","") else f"{int(month):02d}"
+    return m, year
 
 def _find_latest_report(bucket, prefix):
     paginator = s3.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
-
     latest = None
-    for page in pages:
-        contents = page.get("Contents", []) or []
-        for obj in contents:
-            key = obj.get("Key", "")
-            if key == f"{prefix}{SRC_FILE_NAME}" or fnmatch.fnmatch(key, f"{prefix}*/{SRC_FILE_NAME}"):
-                if (latest is None) or (obj["LastModified"] > latest["LastModified"]):
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            k = obj.get("Key", "")
+            if k == f"{prefix}{SRC_FILE_NAME}" or fnmatch.fnmatch(k, f"{prefix}*/{SRC_FILE_NAME}"):
+                if latest is None or obj["LastModified"] > latest["LastModified"]:
                     latest = obj
     return latest
 
-
-def _upload_html_copy(html, year_str, month_str):
-    dest_key = f"{BASE_PREFIX}/{year_str}/{month_str}/{OUT_HTML_NAME}"
-    try:
-        s3.put_object(
-            Bucket=DEST_BUCKET,
-            Key=dest_key,
-            Body=html.encode("utf-8"),
-            ContentType="text/html; charset=utf-8",
-            CacheControl="no-cache"
-        )
-    except ClientError as e:
-        msg = e.response.get("Error", {}).get("Message", str(e))
-        raise RuntimeError(f"Writing HTML to s3://{DEST_BUCKET}/{dest_key} failed: {msg}")
+def _upload_html_copy(html, y, m):
+    dest_key = f"{BASE_PREFIX}/{y}/{m}/{OUT_HTML_NAME}"
+    s3.put_object(
+        Bucket=DEST_BUCKET, Key=dest_key,
+        Body=html.encode("utf-8"),
+        ContentType="text/html; charset=utf-8",
+        CacheControl="no-cache"
+    )
     print(f"[html] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
 
+def _render_and_upload_pdf_playwright(html, y, m):
+    os.environ.setdefault("HOME", "/tmp")
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH)
 
-def _find_chromium_binary():
-    """
-    Prefer headless_shell if available (no GPU process). Otherwise chrome.
-    """
-    base = PLAYWRIGHT_BROWSERS_PATH or "/ms-playwright"
-    # Try headless_shell first
-    for pat in (
-        os.path.join(base, "chromium-*", "chrome-linux", "headless_shell"),
-        os.path.join(base, "chromium-*", "chrome-linux", "chrome"),
-    ):
-        for path in glob.glob(pat):
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                print(f"[pdf] using binary: {path}")
-                return path
-    raise RuntimeError(f"Chromium binary not found under {base}")
+    from playwright.sync_api import sync_playwright
 
-def _render_pdf_with_chromium_cli_and_upload(html, year_str, month_str):
-    """
-    Render PDF via Chromium CLI with flags tuned for Lambda:
-    - prefer headless_shell
-    - if chrome is used, force old headless and disable GPU pipelines
-    """
-    os.makedirs("/tmp/.cache", exist_ok=True)
-    env = os.environ.copy()
-    env.setdefault("HOME", "/tmp")
-    env.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
-    env.setdefault("XDG_RUNTIME_DIR", "/tmp")
-    env.setdefault("FONTCONFIG_PATH", "/etc/fonts")
-    env.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
-
-    html_path = "/tmp/in.html"
-    pdf_path  = "/tmp/uptime-report.pdf"
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
-    try:
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
-    except OSError:
-        pass
-
-    chrome = _find_chromium_binary()
-    url = f"file://{html_path}"
-
-    # Base flags for both chrome and headless_shell
-    base_flags = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--no-zygote",
-        "--disable-extensions",
-        "--disable-software-rasterizer",
-        "--disable-accelerated-2d-canvas",
-        "--disable-webgl",
-        "--disable-features=BackForwardCache",
-        "--font-render-hinting=none",
-        f"--print-to-pdf={pdf_path}",
-        "--print-to-pdf-no-header",
-    ]
-
-    # Extra flags when running chrome (not headless_shell)
-    chrome_only_flags = [
-        "--headless=old",  # old headless is more stable on Lambda
-        "--disable-gpu",
-        "--use-gl=swiftshader",
-        "--disable-features=VizDisplayCompositor,UseSkiaRenderer",
-        "--no-first-run",
-    ]
-
-    cmd = [chrome] + base_flags + (chrome_only_flags if chrome.endswith("/chrome") else []) + [url]
-    print(f"[pdf] exec: {' '.join(cmd)}")
-
-    try:
-        completed = subprocess.run(
-            cmd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=CHROME_TIMEOUT_SEC,   # default 90s; adjust via env if needed
-            check=False,
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox", "--disable-dev-shm-usage",
+                "--disable-gpu", "--single-process", "--no-zygote",
+                "--disable-software-rasterizer",  # AL2 works with this combo
+            ],
         )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Chromium CLI timed out after {CHROME_TIMEOUT_SEC}s")
+        try:
+            ctx = browser.new_context(offline=True)  # fully offline; no egress waits
+            page = ctx.new_page()
+            page.set_default_timeout(PW_STEP_TIMEOUT_MS)
 
-    if completed.returncode != 0:
-        err = (completed.stderr or b"").decode("utf-8", errors="replace")
-        out = (completed.stdout or b"").decode("utf-8", errors="replace")
-        raise RuntimeError(f"Chromium CLI failed (exit {completed.returncode}). stderr: {err[:4000]} stdout: {out[:4000]}")
+            # Block every request at the routing layer too (double safety)
+            page.route("**/*", lambda route: route.abort())
+
+            page.set_content(html, wait_until=PLAYWRIGHT_WAIT, timeout=PW_STEP_TIMEOUT_MS)
+            page.emulate_media(media="print")
+            pdf_path = "/tmp/uptime-report.pdf"
+            page.pdf(path=pdf_path, format="A4", print_background=True, prefer_css_page_size=True, timeout=PW_STEP_TIMEOUT_MS)
+        finally:
+            try: browser.close()
+            except Exception: pass
 
     if not (os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0):
-        raise RuntimeError("Chromium produced no PDF output")
+        raise RuntimeError("Playwright produced no PDF output")
 
-    dest_key = f"{BASE_PREFIX}/{year_str}/{month_str}/{OUT_PDF_NAME}"
+    dest_key = f"{BASE_PREFIX}/{y}/{m}/{OUT_PDF_NAME}"
     with open(pdf_path, "rb") as f:
         s3.put_object(Bucket=DEST_BUCKET, Key=dest_key, Body=f.read(), ContentType="application/pdf")
     print(f"[pdf] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
-
 
 def _assert_bucket_exists(bucket, label="bucket"):
     try:
@@ -284,14 +183,13 @@ def _assert_bucket_exists(bucket, label="bucket"):
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         msg  = e.response.get("Error", {}).get("Message", str(e))
-        if code in ("404", "NoSuchBucket", "NotFound"):
+        if code in ("404","NoSuchBucket","NotFound"):
             raise RuntimeError(f"{label.capitalize()} bucket '{bucket}' does not exist.")
-        if code in ("301", "PermanentRedirect"):
+        if code in ("301","PermanentRedirect"):
             raise RuntimeError(f"{label.capitalize()} bucket '{bucket}' exists in a different region than {AWS_REGION}.")
-        if code in ("403", "AccessDenied"):
+        if code in ("403","AccessDenied"):
             raise RuntimeError(f"Access denied to {label} bucket '{bucket}'.")
         raise RuntimeError(f"S3 head_bucket failed for '{bucket}': {code} {msg}")
-
 
 def _ensure_dest_bucket_exists(bucket):
     try:
@@ -299,29 +197,18 @@ def _ensure_dest_bucket_exists(bucket):
         print(f"[cfg] dest bucket ok: {bucket}")
         return
     except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code not in ("404", "NoSuchBucket", "NotFound"):
+        if e.response.get("Error", {}).get("Code", "") not in ("404","NoSuchBucket","NotFound"):
             msg = e.response.get("Error", {}).get("Message", str(e))
-            raise RuntimeError(f"S3 head_bucket failed for destination '{bucket}': {code} {msg}")
+            raise RuntimeError(f"S3 head_bucket failed for destination '{bucket}': {msg}")
 
     print(f"[cfg] creating destination bucket: {bucket} in {AWS_REGION}")
-    try:
-        if AWS_REGION == "us-east-1":
-            s3.create_bucket(Bucket=bucket)
-        else:
-            s3.create_bucket(
-                Bucket=bucket,
-                CreateBucketConfiguration={"LocationConstraint": AWS_REGION}
-            )
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        msg  = e.response.get("Error", {}).get("Message", str(e))
-        raise RuntimeError(f"Failed to create bucket '{bucket}' in {AWS_REGION}: {code} {msg}")
-
+    if AWS_REGION == "us-east-1":
+        s3.create_bucket(Bucket=bucket)
+    else:
+        s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": AWS_REGION})
 
 def _log_cfg():
     print(f"[cfg] SRC_BUCKET={BUCKET_NAME_SRC!r} DEST_BUCKET={DEST_BUCKET!r} BASE_PREFIX={BASE_PREFIX!r} REGION={AWS_REGION!r}")
-
 
 def _error(code, message):
     print(f"[error] {message}")
