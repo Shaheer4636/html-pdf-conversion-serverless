@@ -4,7 +4,7 @@ FROM public.ecr.aws/lambda/python:3.12
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1
 
-# System libs required by WeasyPrint/Cairo/Pango and fonts for PDF
+# System libs for WeasyPrint / Cairo / Pango + fonts
 RUN dnf install -y \
       cairo pango gdk-pixbuf2 libffi libxml2 libxslt \
       fontconfig freetype libpng libjpeg-turbo \
