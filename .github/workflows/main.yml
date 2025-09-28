@@ -13,7 +13,7 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPO: lambda-uptime-pdf
-  LAMBDA_FUNC: html_to_pdf_lambda_function     # your existing function name
+  LAMBDA_FUNC: html_to_pdf_lambda_function   # existing function name
   ARCH: x86_64
 
   # Lambda runtime config
@@ -21,7 +21,7 @@ env:
   LAMBDA_TIMEOUT: "120"
   LAMBDA_EPHEMERAL: "1024"
 
-  # App env vars (edit buckets/prefix if different)
+  # App env vars passed to Lambda
   SRC_BUCKET: lambda-output-report-000000987123
   DEST_BUCKET: pdf-uptime-reports-0000009
   BASE_PREFIX: uptime
@@ -35,6 +35,7 @@ jobs:
     permissions:
       contents: read
 
+    # Read your repository variables
     env:
       AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
       SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
@@ -75,9 +76,12 @@ jobs:
           set -euo pipefail
           IMAGE_LATEST="${REGISTRY}/${ECR_REPO}:latest"
           IMAGE_SHA="${REGISTRY}/${ECR_REPO}:${GITHUB_SHA}"
+
+          # Build for Lambda's default x86_64
           docker build --platform linux/amd64 -t "${IMAGE_LATEST}" -t "${IMAGE_SHA}" .
           docker push "${IMAGE_LATEST}"
           docker push "${IMAGE_SHA}"
+
           echo "IMAGE_SHA=${IMAGE_SHA}" >> $GITHUB_ENV
 
       - name: Detect function package type
@@ -91,7 +95,7 @@ jobs:
             echo "pkgType=NONE" >> $GITHUB_OUTPUT
           fi
 
-      # Create if missing
+      # Create if missing (container)
       - name: Create function (container)
         if: steps.pkg.outputs.pkgType == 'NONE'
         run: |
@@ -102,9 +106,9 @@ jobs:
             --code ImageUri="${IMAGE_SHA}" \
             --role "${LAMBDA_ROLE_ARN}" \
             --architectures ${ARCH} \
-            --timeout ${LAMBDA_TIMEOUT} \
-            --memory-size ${LAMBDA_MEMORY} \
-            --ephemeral-storage "{\"Size\": ${LAMBDA_EPHEMERAL}}" \
+            --timeout "${LAMBDA_TIMEOUT}" \
+            --memory-size "${LAMBDA_MEMORY}" \
+            --ephemeral-storage '{"Size": '"${LAMBDA_EPHEMERAL}"'}' \
             --environment "Variables={
               SRC_BUCKET=${SRC_BUCKET},
               DEST_BUCKET=${DEST_BUCKET},
@@ -127,9 +131,9 @@ jobs:
             --code ImageUri="${IMAGE_SHA}" \
             --role "${LAMBDA_ROLE_ARN}" \
             --architectures ${ARCH} \
-            --timeout ${LAMBDA_TIMEOUT} \
-            --memory-size ${LAMBDA_MEMORY} \
-            --ephemeral-storage "{\"Size\": ${LAMBDA_EPHEMERAL}}" \
+            --timeout "${LAMBDA_TIMEOUT}" \
+            --memory-size "${LAMBDA_MEMORY}" \
+            --ephemeral-storage '{"Size": '"${LAMBDA_EPHEMERAL}"'}' \
             --environment "Variables={
               SRC_BUCKET=${SRC_BUCKET},
               DEST_BUCKET=${DEST_BUCKET},
@@ -140,7 +144,7 @@ jobs:
             }" \
             --region "${AWS_REGION}"
 
-      # If container already, just update to new image
+      # If already container, just update code to new image
       - name: Update code (container)
         if: steps.pkg.outputs.pkgType == 'Image'
         run: |
@@ -150,15 +154,20 @@ jobs:
             --image-uri "${IMAGE_SHA}" \
             --region "${AWS_REGION}"
 
+      - name: Wait until function is active
+        run: |
+          set -euo pipefail
+          aws lambda wait function-active --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}"
+
+      # Update env/memory/timeout (no --architectures here)
       - name: Update configuration (env/memory/timeout)
         run: |
           set -euo pipefail
           aws lambda update-function-configuration \
             --function-name "${LAMBDA_FUNC}" \
-            --architectures ${ARCH} \
-            --timeout ${LAMBDA_TIMEOUT} \
-            --memory-size ${LAMBDA_MEMORY} \
-            --ephemeral-storage "{\"Size\": ${LAMBDA_EPHEMERAL}}" \
+            --timeout "${LAMBDA_TIMEOUT}" \
+            --memory-size "${LAMBDA_MEMORY}" \
+            --ephemeral-storage '{"Size": '"${LAMBDA_EPHEMERAL}"'}' \
             --environment "Variables={
               SRC_BUCKET=${SRC_BUCKET},
               DEST_BUCKET=${DEST_BUCKET},
@@ -168,6 +177,11 @@ jobs:
               PDF_FORMAT=${PDF_FORMAT}
             }" \
             --region "${AWS_REGION}"
+
+      - name: Wait for configuration to apply
+        run: |
+          set -euo pipefail
+          aws lambda wait function-updated --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}"
 
       - name: Publish version
         run: |
