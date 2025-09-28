@@ -11,7 +11,7 @@ from botocore.exceptions import ClientError
 
 # ====== CONFIG (env overrides) ======
 BUCKET_NAME_SRC = os.getenv("SRC_BUCKET", "lambda-output-report-000000987123")   # source bucket (HTML lives here)
-DEST_BUCKET     = os.getenv("DEST_BUCKET", "pdf-uptime-reorts-0000009")         
+DEST_BUCKET     = os.getenv("DEST_BUCKET", "pdf-uptime-reports-0000009999")         
 BASE_PREFIX     = os.getenv("BASE_PREFIX", "uptime")
 SRC_FILE_NAME   = os.getenv("SRC_FILE_NAME", "uptime-report.html")
 OUT_HTML_NAME   = os.getenv("OUT_HTML_NAME", "uptime-report.html")
