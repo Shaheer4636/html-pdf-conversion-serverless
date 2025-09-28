@@ -10,18 +10,15 @@ import boto3
 from botocore.exceptions import ClientError
 
 # ====== CONFIG (env overrides) ======
-BUCKET_NAME_SRC = os.getenv("SRC_BUCKET", "lambda-output-report-000000987123")   # source bucket (HTML lives here)
-DEST_BUCKET     = os.getenv("DEST_BUCKET", "pdf-uptime-reports-0000009999")         
+BUCKET_NAME_SRC = os.getenv("SRC_BUCKET", "lambda-output-report-000000987123")
+DEST_BUCKET     = os.getenv("DEST_BUCKET", "pdf-uptime-reports-0000009999")  # fixed 'reports'
 BASE_PREFIX     = os.getenv("BASE_PREFIX", "uptime")
-SRC_FILE_NAME   = os.getenv("SRC_FILE_NAME", "uptime-report.html")
-OUT_HTML_NAME   = os.getenv("OUT_HTML_NAME", "uptime-report.html")
-OUT_PDF_NAME    = os.getenv("OUT_PDF_NAME", "uptime-report.pdf")
+SRC_FILE_NAME   = "uptime-report.html"
+OUT_HTML_NAME   = "uptime-report.html"
+OUT_PDF_NAME    = "uptime-report.pdf"
 
-# Behavior toggles
 ALLOW_PDF_SKIP  = os.getenv("ALLOW_PDF_SKIP", "false").lower() in ("1","true","yes")
 DEBUG_DEFAULT   = os.getenv("DEBUG_DEFAULT", "false").lower() in ("1","true","yes")
-PLAYWRIGHT_WAIT = os.getenv("PLAYWRIGHT_WAIT", "domcontentloaded")  # 'load' | 'domcontentloaded' | 'networkidle'
-PDF_FORMAT      = os.getenv("PDF_FORMAT", "A4")                      # e.g. 'A4', 'Letter'
 # ====================================
 
 s3 = boto3.client("s3")
