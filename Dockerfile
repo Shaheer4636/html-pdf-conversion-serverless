@@ -1,20 +1,35 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# System libs needed by WeasyPrint (Pango/Cairo stack)
+# Native libs WeasyPrint needs
 RUN dnf install -y \
       cairo cairo-gobject pango gdk-pixbuf2 \
       libjpeg-turbo libpng zlib \
       fontconfig freetype harfbuzz fribidi \
-      libxml2 libxslt && \
-    dnf clean all
+      libxml2 libxslt tzdata \
+      dejavu-sans-fonts dejavu-serif-fonts \
+  && dnf clean all
 
-# Put WeasyPrint caches/fonts in writable /tmp to silence fontconfig warnings
+# Writable cache for fontconfig/pango to silence warnings
 ENV XDG_CACHE_HOME=/tmp \
     HOME=/tmp
 
-# Install Python deps into /var/task/vendor so we control import order
-COPY requirements-vendor.txt /var/task/requirements-vendor.txt
-RUN pip install --no-cache-dir -r /var/task/requirements-vendor.txt -t /var/task/vendor
+# Sanity check the native libs
+RUN test -f /usr/lib64/libpango-1.0.so.0 && \
+    test -f /usr/lib64/libcairo.so.2 && \
+    test -f /usr/lib64/libgdk_pixbuf-2.0.so.0
+
+# Install Python deps directly into /var/task/vendor
+# IMPORTANT: WeasyPrint 61.x requires pydyf < 0.11; we pin pydyf==0.10.0
+RUN pip install --no-cache-dir -t /var/task/vendor \
+      weasyprint==61.2 \
+      pydyf==0.10.0 \
+      tinycss2==1.3.0 \
+      cssselect2==0.7.0 \
+      html5lib==1.1 \
+      fonttools==4.53.0 \
+      Pillow==10.3.0 \
+      Pyphen==0.14.0 \
+      cffi==1.16.0
 
 # Your handler
 COPY lambda_function.py /var/task/lambda_function.py
