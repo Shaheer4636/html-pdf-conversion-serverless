@@ -1,3 +1,2 @@
 boto3
-botocore
-playwright==1.46.0
+weasyprint==61.2
