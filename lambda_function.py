@@ -90,7 +90,7 @@ def _get_debug(event):
 def _resolve_month_year(event):
     event = event or {}; qs = event.get("queryStringParameters") or {}
     def _get(k):
-        v = qs.get(k); 
+        v = qs.get(k)
         if v is None and isinstance(event, dict): v = event.get(k)
         return (v or "").strip() if isinstance(v, str) else v
     month = (_get("month") or "auto").lower()
@@ -130,12 +130,21 @@ def _upload_html_copy(html, y, m):
     print(f"[html] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
 
 def _render_and_upload_pdf_weasyprint(html, y, m):
-    # WeasyPrint render (no JS)
+    # Writable caches for fontconfig in Lambda
+    os.makedirs("/tmp/.cache", exist_ok=True)
+    os.environ.setdefault("HOME", "/tmp")
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
+    os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
+    os.environ.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
+
     from weasyprint import HTML
+    # If your HTML uses relative URLs (e.g., <img src="...">), set base_url to a directory
     pdf_path = "/tmp/uptime-report.pdf"
-    HTML(string=html, base_url="file:///tmp").write_pdf(pdf_path, presentational_hints=True)
+    HTML(string=html, base_url="/tmp").write_pdf(target=pdf_path)
+
     if not (os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0):
         raise RuntimeError("WeasyPrint produced no PDF output")
+
     dest_key = f"{BASE_PREFIX}/{y}/{m}/{OUT_PDF_NAME}"
     with open(pdf_path, "rb") as f:
         s3.put_object(Bucket=DEST_BUCKET, Key=dest_key, Body=f.read(), ContentType="application/pdf")
