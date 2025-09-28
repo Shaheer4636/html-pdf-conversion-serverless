@@ -1,4 +1,3 @@
-# lambda_function.py
 import json
 import fnmatch
 import os
@@ -7,11 +6,11 @@ from datetime import datetime, timezone, timedelta
 import boto3
 from botocore.exceptions import ClientError
 
-# ---------- configuration (env overrides) ----------
 def _env(name, default=""):
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else v
 
+# --------- config (env overrides) ----------
 BUCKET_NAME_SRC = _env("SRC_BUCKET", "lambda-output-report-000000987123")
 DEST_BUCKET     = _env("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX     = _env("BASE_PREFIX", "uptime")
@@ -22,23 +21,21 @@ OUT_PDF_NAME    = "uptime-report.pdf"
 
 ALLOW_PDF_SKIP  = _env("ALLOW_PDF_SKIP", "false").lower() in ("1", "true", "yes")
 DEBUG_DEFAULT   = _env("DEBUG_DEFAULT", "false").lower() in ("1", "true", "yes")
-PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "load")   # safer than networkidle in Lambda
+
+# CRUCIAL: do not wait for 3rd-party assets; Lambda often has no egress
+PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "domcontentloaded")
 PDF_FORMAT      = _env("PDF_FORMAT", "A4")
 AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
+PW_STEP_TIMEOUT_MS = int(_env("PW_STEP_TIMEOUT_MS", "20000"))  # 20s per step
 
-# Playwright browsers are baked into the image here
 PLAYWRIGHT_BROWSERS_PATH = _env("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
-
-# Lambda limits: keep operations snappy to avoid hitting overall timeout
-PW_STEP_TIMEOUT_MS = int(_env("PW_STEP_TIMEOUT_MS", "45000"))
-# ---------------------------------------------------
+# ------------------------------------------
 
 s3 = boto3.client("s3")
 
 
 def handler(event, context):
     debug = _get_debug(event)
-
     try:
         month_str, year_str = _resolve_month_year(event)
     except ValueError as ve:
@@ -52,7 +49,6 @@ def handler(event, context):
         "html_uploaded": False, "pdf_uploaded": False
     }
 
-    # Log effective config and ensure buckets are usable. Create dest if missing.
     try:
         _log_cfg()
         _assert_bucket_exists(BUCKET_NAME_SRC, label="source")
@@ -61,7 +57,6 @@ def handler(event, context):
         return _error(404, str(e))
 
     try:
-        # 1) Pick newest source HTML
         latest = _find_latest_report(BUCKET_NAME_SRC, prefix)
         if latest is None:
             return _error(404, f'No "{SRC_FILE_NAME}" found under s3://{BUCKET_NAME_SRC}/{prefix} (including subfolders).')
@@ -73,11 +68,9 @@ def handler(event, context):
         obj = s3.get_object(Bucket=BUCKET_NAME_SRC, Key=key)
         html = obj["Body"].read().decode("utf-8", errors="replace")
 
-        # 2) Store a copy of the HTML in DEST (helps retrieve exact source later)
         _upload_html_copy(html, year_str, month_str)
         status["html_uploaded"] = True
 
-        # 3) Render PDF with Playwright/Chromium
         try:
             _render_and_upload_pdf_playwright(html, year_str, month_str)
             status["pdf_uploaded"] = True
@@ -86,7 +79,6 @@ def handler(event, context):
             if not ALLOW_PDF_SKIP:
                 return _error(500, f"PDF generation failed: {e}")
 
-        # 4) Response
         if debug:
             return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(status)}
         return {"statusCode": 200, "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}, "body": html}
@@ -102,7 +94,7 @@ def lambda_handler(event, context):
     return handler(event, context)
 
 
-# ---------------- helpers ----------------
+# ------------- helpers -------------
 
 def _get_debug(event):
     debug = DEBUG_DEFAULT
@@ -148,12 +140,11 @@ def _resolve_month_year(event):
 def _find_latest_report(bucket, prefix):
     paginator = s3.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
-
     latest = None
     for page in pages:
         for obj in page.get("Contents", []) or []:
-            key = obj.get("Key", "")
-            if key == f"{prefix}{SRC_FILE_NAME}" or fnmatch.fnmatch(key, f"{prefix}*/{SRC_FILE_NAME}"):
+            k = obj.get("Key", "")
+            if k == f"{prefix}{SRC_FILE_NAME}" or fnmatch.fnmatch(k, f"{prefix}*/{SRC_FILE_NAME}"):
                 if (latest is None) or (obj["LastModified"] > latest["LastModified"]):
                     latest = obj
     return latest
@@ -176,16 +167,9 @@ def _upload_html_copy(html, year_str, month_str):
 
 
 def _render_and_upload_pdf_playwright(html, year_str, month_str):
-    """
-    Stable Playwright/Chromium launch for Lambda.
-    - Runs fully headless, no GPU, single process
-    - Uses /tmp for caches (fontconfig etc.)
-    - Tight per-step timeouts to avoid whole-function timeouts
-    """
     import shutil
     from playwright.sync_api import sync_playwright
 
-    # Writable caches for fontconfig & Chromium
     os.makedirs("/tmp/.cache", exist_ok=True)
     os.environ.setdefault("HOME", "/tmp")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
@@ -204,7 +188,6 @@ def _render_and_upload_pdf_playwright(html, year_str, month_str):
     ]
 
     pdf_path = "/tmp/uptime-report.pdf"
-    # Clean any leftover file
     try:
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
@@ -214,12 +197,11 @@ def _render_and_upload_pdf_playwright(html, year_str, month_str):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=launch_args)
         try:
-            ctx = browser.new_context()
+            # Block all external network so we never wait on the internet
+            ctx = browser.new_context(offline=True)
             page = ctx.new_page()
             page.set_default_timeout(PW_STEP_TIMEOUT_MS)
 
-            # Set content and render quickly. If your HTML references external
-            # assets and Lambda has no egress, 'load' is safer than 'networkidle'.
             page.set_content(html, wait_until=PLAYWRIGHT_WAIT, timeout=PW_STEP_TIMEOUT_MS)
             page.emulate_media(media="print")
             page.pdf(
@@ -279,10 +261,7 @@ def _ensure_dest_bucket_exists(bucket):
         if AWS_REGION == "us-east-1":
             s3.create_bucket(Bucket=bucket)
         else:
-            s3.create_bucket(
-                Bucket=bucket,
-                CreateBucketConfiguration={"LocationConstraint": AWS_REGION}
-            )
+            s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": AWS_REGION})
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         msg  = e.response.get("Error", {}).get("Message", str(e))
