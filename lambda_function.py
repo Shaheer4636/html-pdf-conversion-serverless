@@ -192,15 +192,48 @@ def _upload_html_copy(html, year_str, month_str):
 
 
 def _render_and_upload_pdf_playwright(html, year_str, month_str):
+    """
+    Render HTML to PDF using Playwright/Chromium in Lambda.
+    Forces a stable headless setup (no GPU, single process) and writable font cache.
+    """
+    import os
     from playwright.sync_api import sync_playwright
 
+    # Make fontconfig + Chromium caches writable in Lambda
+    os.makedirs("/tmp/.cache", exist_ok=True)
+    os.environ.setdefault("HOME", "/tmp")
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
+    os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
+    os.environ.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
+
+    launch_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-accelerated-2d-canvas",
+        "--disable-webgl",
+        "--no-zygote",
+        "--single-process",
+        "--headless=new",            # force new headless to avoid old-headless glitches
+        "--export-tagged-pdf",       # needed for page.pdf
+    ]
+
     pdf_path = "/tmp/uptime-report.pdf"
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox"])
-        page = browser.new_page()
-        page.set_content(html, wait_until=PLAYWRIGHT_WAIT)
-        page.pdf(path=pdf_path, print_background=True, format=PDF_FORMAT)
-        browser.close()
+        browser = p.chromium.launch(headless=True, args=launch_args)
+        try:
+            page = browser.new_page()
+            page.set_content(html, wait_until=PLAYWRIGHT_WAIT)
+            page.pdf(path=pdf_path, print_background=True, format=PDF_FORMAT)
+        finally:
+            # ensure chromium really closes; avoids “target closed” races
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
         raise RuntimeError("Playwright produced no PDF output")
@@ -213,6 +246,7 @@ def _render_and_upload_pdf_playwright(html, year_str, month_str):
         msg = e.response.get("Error", {}).get("Message", str(e))
         raise RuntimeError(f"Writing PDF to s3://{DEST_BUCKET}/{dest_key} failed: {msg}")
     print(f"[pdf] Uploaded PDF -> s3://{DEST_BUCKET}/{dest_key}")
+
 
 
 def _assert_bucket_exists(bucket, label="bucket"):
