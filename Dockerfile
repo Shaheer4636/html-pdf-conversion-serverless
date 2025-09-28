@@ -1,21 +1,21 @@
+# Dockerfile
 FROM public.ecr.aws/lambda/python:3.12
 
-RUN yum install -y \
-    libX11 libXcomposite libXcursor libXdamage libXext libXi libXtst \
-    pango cups-libs libXrandr alsa-lib atk at-spi2-atk at-spi2-core \
-    gtk3 mesa-libgbm nss freetype fontconfig \
-    xorg-x11-fonts-Type1 xorg-x11-fonts-75dpi \
-  && yum clean all
+# AL2023 uses dnf (not yum)
+RUN dnf install -y \
+      at-spi2-atk at-spi2-core atk \
+      cups-libs gtk3 \
+      libX11 libXcomposite libXcursor libXdamage libXext libXi libXtst libXrandr \
+      alsa-lib mesa-libgbm nss \
+      pango freetype fontconfig \
+      dejavu-sans-fonts dejavu-serif-fonts \
+  && dnf clean all
 
-# Python 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Chromium for Playwright inside the image
-RUN python -m playwright install --with-deps chromium
+# Fetch the Chromium binary Playwright uses
+RUN python -m playwright install chromium
 
-# Your handler file
 COPY lambda_function.py ${LAMBDA_TASK_ROOT}/
-
-# Lambda will call: lambda_function.lambda_handler
 CMD ["lambda_function.lambda_handler"]
