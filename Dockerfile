@@ -7,7 +7,7 @@ RUN yum install -y \
     xorg-x11-fonts-Type1 xorg-x11-fonts-75dpi \
   && yum clean all
 
-# Python deps
+# Python 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
