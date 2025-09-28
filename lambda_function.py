@@ -1,6 +1,7 @@
 import os, sys, json, logging, tempfile, datetime as dt
 import boto3
 
+# Force our vendored libs to load before any /opt/python layer
 VENDOR = os.path.join(os.path.dirname(__file__), "vendor")
 if VENDOR not in sys.path:
     sys.path.insert(0, VENDOR)
@@ -27,9 +28,12 @@ def _err(code, msg):
             "body": json.dumps({"error": msg})}
 
 def lambda_handler(event, context):
-    log.info("[versions] weasyprint=%s pydyf=%s", getattr(weasyprint,"__version__","?"), getattr(pydyf,"__version__","?"))
-    log.info("[files] weasyprint=%s", getattr(weasyprint,"__file__","?"))
-    log.info("[files] pydyf=%s", getattr(pydyf,"__file__","?"))
+    # Diagnostics to confirm correct libs
+    log.info("[versions] weasyprint=%s pydyf=%s",
+             getattr(weasyprint, "__version__", "?"),
+             getattr(pydyf, "__version__", "?"))
+    log.info("[files] weasyprint=%s", getattr(weasyprint, "__file__", "?"))
+    log.info("[files] pydyf=%s", getattr(pydyf, "__file__", "?"))
     log.info("[sys.path0..4] %s", sys.path[:5])
 
     month = (event or {}).get("month") or f"{dt.date.today().month:02d}"
@@ -78,6 +82,3 @@ def lambda_handler(event, context):
     except Exception as e:
         log.exception("PDF generation failed")
         return _err(500, f"PDF generation failed: {e}")
-
-
-#push
