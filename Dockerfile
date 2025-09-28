@@ -1,6 +1,5 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# System libs needed by Chromium
 RUN yum install -y \
     libX11 libXcomposite libXcursor libXdamage libXext libXi libXtst \
     pango cups-libs libXrandr alsa-lib atk at-spi2-atk at-spi2-core \
