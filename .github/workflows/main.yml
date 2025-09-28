@@ -1,0 +1,114 @@
+name: Build & Deploy Lambda (Container Image)
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "Dockerfile"
+      - "requirements.txt"
+      - "lambda_function.py"
+      - ".github/workflows/deploy-lambda-image.yml"
+  workflow_dispatch:
+
+env:
+  # --- EDIT THESE FOR YOUR ACCOUNT/SETUP ---
+  AWS_REGION: us-east-1                 # your region
+  ECR_REPO: lambda-uptime-pdf           # ECR repo name (will be created if missing)
+  LAMBDA_FUNC: uptime-pdf               # existing Lambda function name
+  ARCH: x86_64                          # keep x86_64 unless you rebuild for arm64
+
+  # Lambda runtime config
+  LAMBDA_MEMORY: "1536"
+  LAMBDA_TIMEOUT: "120"
+  LAMBDA_EPHEMERAL: "1024"              # MB for /tmp
+
+  # App env vars passed to Lambda
+  SRC_BUCKET: lambda-output-report-000000987123
+  DEST_BUCKET: pdf-uptime-reports-0000009
+  BASE_PREFIX: uptime
+  ALLOW_PDF_SKIP: "false"
+  PLAYWRIGHT_WAIT: domcontentloaded
+  PDF_FORMAT: A4
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Uses your repository variables (NOT secrets) as provided in your screenshot
+      - name: Configure AWS credentials (from repo variables)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ vars.AWS_ACCESS_KEYS }}
+          aws-secret-access-key: ${{ vars.AWS_SECRECT_ACCESS_KEYS }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR repo exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${ECR_REPO}" --image-scanning-configuration scanOnPush=true
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        shell: bash
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${REGISTRY}/${ECR_REPO}:latest"
+          IMAGE_SHA="${REGISTRY}/${ECR_REPO}:${GITHUB_SHA}"
+
+          # Build for Lambda's default x86_64
+          docker build --platform linux/amd64 -t "${IMAGE_URI}" -t "${IMAGE_SHA}" .
+
+          docker push "${IMAGE_URI}"
+          docker push "${IMAGE_SHA}"
+
+          echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
+          echo "IMAGE_SHA=${IMAGE_SHA}" >> $GITHUB_ENV
+
+      - name: Update Lambda code to new image
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This assumes the function already exists. If not, create it once in console.
+          aws lambda update-function-code \
+            --function-name "${LAMBDA_FUNC}" \
+            --image-uri "${IMAGE_SHA}" \
+            --region "${AWS_REGION}"
+
+      - name: Update Lambda configuration (memory/timeout/env)
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws lambda update-function-configuration \
+            --function-name "${LAMBDA_FUNC}" \
+            --architectures ${ARCH} \
+            --timeout ${LAMBDA_TIMEOUT} \
+            --memory-size ${LAMBDA_MEMORY} \
+            --ephemeral-storage "{\"Size\": ${LAMBDA_EPHEMERAL}}" \
+            --environment "Variables={
+              SRC_BUCKET=${SRC_BUCKET},
+              DEST_BUCKET=${DEST_BUCKET},
+              BASE_PREFIX=${BASE_PREFIX},
+              ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
+              PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
+              PDF_FORMAT=${PDF_FORMAT}
+            }" \
+            --region "${AWS_REGION}"
+
+      - name: Publish version
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws lambda publish-version --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}" >/dev/null
