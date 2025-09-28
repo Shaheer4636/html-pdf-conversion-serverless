@@ -19,7 +19,7 @@ BASE_PREFIX  = os.getenv("BASE_PREFIX",  "uptime")
 SRC_FILE_NAME  = "uptime-report.html"
 OUT_HTML_NAME  = "uptime-report.html"
 OUT_PDF_NAME   = "uptime-report.pdf"
-PDF_FORMAT     = os.getenv("PDF_FORMAT", "A4")
+PDF_FORMAT     = str(os.getenv("PDF_FORMAT", "A4"))  # ensure string
 ALLOW_PDF_SKIP = os.getenv("ALLOW_PDF_SKIP", "false").lower() in ("1","true","yes")
 # ====================================
 
@@ -36,6 +36,7 @@ def lambda_handler(event, context):
     except Exception as _e:
         print(f"[versions] introspection failed: {_e}")
 
+    # Resolve month/year robustly
     try:
         month_str, year_str = _resolve_month_year(event or {})
     except ValueError as ve:
@@ -45,22 +46,26 @@ def lambda_handler(event, context):
     print(f"[cfg] SRC_BUCKET='{SRC_BUCKET}' DEST_BUCKET='{DEST_BUCKET}' BASE_PREFIX='{BASE_PREFIX}'")
     print(f"[src] s3://{SRC_BUCKET}/{prefix}{SRC_FILE_NAME}")
 
+    # Validate dest bucket
     try:
         s3.head_bucket(Bucket=DEST_BUCKET)
         print(f"[cfg] dest bucket ok: {DEST_BUCKET}")
     except ClientError as e:
         return _error(404, f"S3 head_bucket failed for '{DEST_BUCKET}': {e.response.get('Error', {}).get('Message', str(e))}")
 
+    # Find source HTML
     key = _find_existing_key(SRC_BUCKET, prefix, SRC_FILE_NAME)
     if not key:
         return _error(404, f'No "{SRC_FILE_NAME}" under s3://{SRC_BUCKET}/{prefix} (direct or nested).')
 
+    # Read HTML
     try:
         obj = s3.get_object(Bucket=SRC_BUCKET, Key=key)
         html = obj["Body"].read().decode("utf-8", errors="replace")
     except Exception as e:
         return _error(500, f"Failed to read source HTML: {e}")
 
+    # Copy HTML to dest
     dest_html_key = f"{prefix}{OUT_HTML_NAME}"
     try:
         s3.put_object(
@@ -72,6 +77,7 @@ def lambda_handler(event, context):
     except Exception as e:
         return _error(500, f"Failed to write HTML to destination: {e}")
 
+    # HTML -> PDF
     try:
         pdf_bytes = _render_pdf_weasy(html, pdf_format=PDF_FORMAT)
         dest_pdf_key = f"{prefix}{OUT_PDF_NAME}"
@@ -85,6 +91,7 @@ def lambda_handler(event, context):
         if not ALLOW_PDF_SKIP:
             return _error(500, f"PDF generation failed: {e}")
 
+    # Response
     if _want_debug(event or {}):
         return {
             "statusCode": 200,
@@ -104,7 +111,10 @@ def lambda_handler(event, context):
         "body": html
     }
 
+# ---------- helpers ----------
+
 def _render_pdf_weasy(html: str, pdf_format: str = "A4") -> bytes:
+    # Writable caches for fontconfig/Pango on Lambda
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
     os.environ.setdefault("HOME", "/tmp")
     css = CSS(string=f"@page {{ size: {pdf_format}; margin: 12mm; }}")
@@ -113,15 +123,23 @@ def _render_pdf_weasy(html: str, pdf_format: str = "A4") -> bytes:
     return buf.getvalue()
 
 def _resolve_month_year(event):
+    """Accepts month/year as str|int in query params or at top-level JSON."""
     qs = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
-    def _get(k):
-        v = qs.get(k) if isinstance(qs, dict) else None
+
+    def _get(key):
+        v = qs.get(key) if isinstance(qs, dict) else None
         if v is None and isinstance(event, dict):
-            v = event.get(k)
-        return (v or "").strip()
-    month = (_get("month") or "auto").lower()
+            v = event.get(key)
+        if v is None:
+            return ""
+        return str(v).strip()
+
+    month_raw = _get("month")
+    month = (month_raw or "auto").lower()
     year  = _get("year")
+
     now = datetime.now(timezone.utc)
+
     if month in ("auto", ""):
         use_dt = now
     elif month in ("prev", "previous", "last"):
@@ -131,6 +149,7 @@ def _resolve_month_year(event):
             raise ValueError('Invalid "month". Use two digits like "09", or "auto", or "prev".')
         y = int(year) if year else now.year
         use_dt = datetime(y, int(month), 1, tzinfo=timezone.utc)
+
     if not year:
         year = str(use_dt.year)
     return f"{use_dt.month:02d}", year
@@ -151,9 +170,19 @@ def _find_existing_key(bucket, prefix, filename):
     return None
 
 def _want_debug(event):
+    """Accepts debug as bool|int|str at query or top-level."""
     qs = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
-    dv = (qs.get("debug") or (event.get("debug") if isinstance(event, dict) else "") or "").strip().lower()
-    return dv in ("1", "true", "yes")
+    v = qs.get("debug") if isinstance(qs, dict) else None
+    if v is None and isinstance(event, dict):
+        v = event.get("debug")
+
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return False
 
 def _error(code, message):
     print(f"[error] {message}")
