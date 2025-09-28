@@ -15,6 +15,13 @@ RUN dnf install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Verify versions at build time (prints into build logs)
+RUN python - <<'PY'
+import weasyprint, pydyf, sys
+print("VERIFY at build: weasyprint", weasyprint.__version__)
+print("VERIFY at build: pydyf", pydyf.__version__)
+PY
+
 # Function code
 COPY lambda_function.py ${LAMBDA_TASK_ROOT}/
 CMD ["lambda_function.lambda_handler"]
