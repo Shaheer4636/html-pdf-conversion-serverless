@@ -14,7 +14,7 @@ RUN dnf install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Fetch the Chromium binary Playwright uses
+# Fetch the Chromium binary Playwr
 RUN python -m playwright install chromium
 
 COPY lambda_function.py ${LAMBDA_TASK_ROOT}/
