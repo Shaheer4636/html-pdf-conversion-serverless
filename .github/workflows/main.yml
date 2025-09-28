@@ -4,10 +4,7 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "Dockerfile"
-      - "requirements.txt"
       - "lambda_function.py"
-      - ".github/workflows/deploy-lambda-image.yml"
   workflow_dispatch:
 
 env:
