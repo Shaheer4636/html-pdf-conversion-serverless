@@ -1,4 +1,4 @@
-import json, fnmatch, os
+import json, fnmatch, os, inspect
 from datetime import datetime, timezone, timedelta
 
 import boto3
@@ -26,12 +26,14 @@ AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
 s3 = boto3.client("s3")
 
 def handler(event, context):
-    # Log weasyprint/pydyf versions at runtime for sanity
+    # Runtime verification: print exact versions and PDF.__init__ signature
     try:
-        import weasyprint, pydyf
+        import weasyprint, pydyf, sys
         print(f"[versions] weasyprint={weasyprint.__version__} pydyf={pydyf.__version__}")
+        print(f"[versions] PDF.__init__ signature: {inspect.signature(pydyf.PDF.__init__)}")
+        print(f"[versions] sys.path[0:3]: {sys.path[:3]}")
     except Exception as e:
-        print(f"[versions] failed to import/inspect: {e}")
+        print(f"[versions] failed: {e}")
 
     debug = _get_debug(event)
     try:
