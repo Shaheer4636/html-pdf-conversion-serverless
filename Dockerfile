@@ -1,4 +1,3 @@
-# Lambda Python 3.12 base image
 FROM public.ecr.aws/lambda/python:3.12
 
 # System libs needed by Chromium
