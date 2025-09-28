@@ -1,84 +1,175 @@
-import os, sys, json, logging, tempfile, datetime as dt
+# lambda_function.py
+import json, os, sys, io, inspect
+from datetime import datetime, timezone, timedelta
 import boto3
+from botocore.exceptions import ClientError
 
-# Force our vendored libs to load before any /opt/python layer
-VENDOR = os.path.join(os.path.dirname(__file__), "vendor")
-if VENDOR not in sys.path:
-    sys.path.insert(0, VENDOR)
+# Put vendored libs first
+VENDOR_DIR = "/var/task/vendor"
+if VENDOR_DIR not in sys.path:
+    sys.path.insert(0, VENDOR_DIR)
 
+# WeasyPrint (HTML->PDF)
 from weasyprint import HTML, CSS
-import weasyprint, pydyf
+import pydyf
 
-log = logging.getLogger()
-log.setLevel(logging.INFO)
+# ====== CONFIG (env overrides) ======
+SRC_BUCKET   = os.getenv("SRC_BUCKET",   "lambda-output-report-000000987123")
+DEST_BUCKET  = os.getenv("DEST_BUCKET",  "pdf-uptime-reports-0000009")
+BASE_PREFIX  = os.getenv("BASE_PREFIX",  "uptime")
+SRC_FILE_NAME  = "uptime-report.html"
+OUT_HTML_NAME  = "uptime-report.html"
+OUT_PDF_NAME   = "uptime-report.pdf"
+PDF_FORMAT     = os.getenv("PDF_FORMAT", "A4")  # A4 by default
+ALLOW_PDF_SKIP = os.getenv("ALLOW_PDF_SKIP", "false").lower() in ("1","true","yes")
+# ====================================
+
 s3 = boto3.client("s3")
 
-SRC_BUCKET  = os.getenv("SRC_BUCKET",  "lambda-output-report-000000987123")
-DEST_BUCKET = os.getenv("DEST_BUCKET", "pdf-uptime-reports-0000009")
-BASE_PREFIX = os.getenv("BASE_PREFIX", "uptime")
-SRC_FILE    = "uptime-report.html"
-OUT_HTML    = "uptime-report.html"
-OUT_PDF     = "uptime-report.pdf"
-
-def _s3_key(prefix, year, month, name): return f"{prefix}/{year}/{month}/{name}"
-
-def _err(code, msg):
-    log.error(msg)
-    return {"statusCode": code, "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"error": msg})}
-
 def lambda_handler(event, context):
-    # Diagnostics to confirm correct libs
-    log.info("[versions] weasyprint=%s pydyf=%s",
-             getattr(weasyprint, "__version__", "?"),
-             getattr(pydyf, "__version__", "?"))
-    log.info("[files] weasyprint=%s", getattr(weasyprint, "__file__", "?"))
-    log.info("[files] pydyf=%s", getattr(pydyf, "__file__", "?"))
-    log.info("[sys.path0..4] %s", sys.path[:5])
+    # Log versions + environment once per invoke (helps diagnose if layers/images drift)
+    try:
+        wv = getattr(__import__("weasyprint"), "__version__", "unknown")
+        pv = getattr(pydyf, "__version__", "unknown")
+        print(f"[versions] weasyprint={wv} pydyf={pv}")
+        print(f"[versions] PDF.__init__ signature: {tuple(inspect.signature(pydyf.PDF.__init__).parameters.keys())}")
+        print(f"[sys.path0..3]: {sys.path[:4]}")
+    except Exception as _e:
+        print(f"[versions] introspection failed: {_e}")
 
-    month = (event or {}).get("month") or f"{dt.date.today().month:02d}"
-    year  = (event or {}).get("year")  or f"{dt.date.today().year:04d}"
+    # Parse inputs (month/year)
+    try:
+        month_str, year_str = _resolve_month_year(event or {})
+    except ValueError as ve:
+        return _error(400, str(ve))
 
+    prefix = f"{BASE_PREFIX}/{year_str}/{month_str}/"
+    print(f"[cfg] SRC_BUCKET='{SRC_BUCKET}' DEST_BUCKET='{DEST_BUCKET}' BASE_PREFIX='{BASE_PREFIX}'")
+    print(f"[src] s3://{SRC_BUCKET}/{prefix}{SRC_FILE_NAME}")
+
+    # Head dest bucket once (catches region/typo early)
     try:
         s3.head_bucket(Bucket=DEST_BUCKET)
-    except Exception as e:
-        return _err(500, f"Dest bucket check failed for '{DEST_BUCKET}': {e}")
+        print(f"[cfg] dest bucket ok: {DEST_BUCKET}")
+    except ClientError as e:
+        return _error(404, f"S3 head_bucket failed for '{DEST_BUCKET}': {e.response.get('Error', {}).get('Message', str(e))}")
 
-    src_key  = _s3_key(BASE_PREFIX, year, month, SRC_FILE)
-    out_html = _s3_key(BASE_PREFIX, year, month, OUT_HTML)
-    out_pdf  = _s3_key(BASE_PREFIX, year, month, OUT_PDF)
+    # 1) Read HTML from source (allow a subfolder or direct key)
+    key = _find_existing_key(SRC_BUCKET, prefix, SRC_FILE_NAME)
+    if not key:
+        return _error(404, f'No "{SRC_FILE_NAME}" under s3://{SRC_BUCKET}/{prefix} (direct or nested).')
 
-    log.info("[cfg] SRC_BUCKET='%s' DEST_BUCKET='%s' BASE_PREFIX='%s'", SRC_BUCKET, DEST_BUCKET, BASE_PREFIX)
-    log.info("[src] s3://%s/%s", SRC_BUCKET, src_key)
+    obj = s3.get_object(Bucket=SRC_BUCKET, Key=key)
+    html = obj["Body"].read().decode("utf-8", errors="replace")
 
+    # 2) Upload HTML copy to destination
+    dest_html_key = f"{prefix}{OUT_HTML_NAME}"
+    s3.put_object(
+        Bucket=DEST_BUCKET, Key=dest_html_key,
+        Body=html.encode("utf-8"),
+        ContentType="text/html; charset=utf-8", CacheControl="no-cache"
+    )
+    print(f"[html] uploaded -> s3://{DEST_BUCKET}/{dest_html_key}")
+
+    # 3) Render PDF with WeasyPrint
     try:
-        obj = s3.get_object(Bucket=SRC_BUCKET, Key=src_key)
-        html = obj["Body"].read().decode("utf-8")
-    except s3.exceptions.NoSuchKey:
-        return _err(404, f"s3://{SRC_BUCKET}/{src_key} not found")
+        pdf_bytes = _render_pdf_weasy(html, pdf_format=PDF_FORMAT)
+        dest_pdf_key = f"{prefix}{OUT_PDF_NAME}"
+        s3.put_object(
+            Bucket=DEST_BUCKET, Key=dest_pdf_key,
+            Body=pdf_bytes, ContentType="application/pdf", CacheControl="no-cache"
+        )
+        print(f"[pdf] uploaded -> s3://{DEST_BUCKET}/{dest_pdf_key}")
     except Exception as e:
-        return _err(500, f"Failed to read source HTML: {e}")
+        print("[error] PDF generation failed:", e)
+        if not ALLOW_PDF_SKIP:
+            return _error(500, f"PDF generation failed: {e}")
 
-    try:
-        s3.put_object(Bucket=DEST_BUCKET, Key=out_html, Body=html.encode("utf-8"),
-                      ContentType="text/html; charset=utf-8")
-        log.info("[html] uploaded -> s3://%s/%s", DEST_BUCKET, out_html)
-    except Exception as e:
-        return _err(500, f"Failed to write HTML to destination: {e}")
+    # 4) Response
+    debug = _want_debug(event or {})
+    if debug:
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "src_bucket": SRC_BUCKET,
+                "dest_bucket": DEST_BUCKET,
+                "prefix": prefix,
+                "html_key": key,
+                "dest_html_key": dest_html_key,
+                "dest_pdf_key": f"{prefix}{OUT_PDF_NAME}"
+            })
+        }
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
+        "body": html
+    }
 
+# ---------- helpers ----------
+
+def _render_pdf_weasy(html: str, pdf_format: str = "A4") -> bytes:
+    # Writable caches for fontconfig/Pango
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+    os.environ.setdefault("HOME", "/tmp")
+
+    # Basic page setup; WeasyPrint doesn’t support CSS grid yet (those warnings are harmless)
+    css = CSS(string=f"@page {{ size: {pdf_format}; margin: 12mm; }}")
+
+    # Call WeasyPrint; this will use pydyf under the hood
+    # With pydyf >=0.11 + WeasyPrint <63 this used to explode; we pinned versions to prevent that.
+    out = io.BytesIO()
+    HTML(string=html, base_url="/").write_pdf(out, stylesheets=[css])
+    return out.getvalue()
+
+def _resolve_month_year(event):
+    qs = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
+    def _get(k):
+        v = qs.get(k) if isinstance(qs, dict) else None
+        if v is None and isinstance(event, dict):
+            v = event.get(k)
+        return (v or "").strip()
+
+    month = (_get("month") or "auto").lower()
+    year  = _get("year")
+    now = datetime.now(timezone.utc)
+
+    if month in ("auto", ""):
+        use_dt = now
+    elif month in ("prev", "previous", "last"):
+        use_dt = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1))
+    else:
+        if not month.isdigit() or not (1 <= int(month) <= 12):
+            raise ValueError('Invalid "month". Use two digits like "09", or "auto", or "prev".')
+        y = int(year) if year else now.year
+        use_dt = datetime(y, int(month), 1, tzinfo=timezone.utc)
+
+    if not year:
+        year = str(use_dt.year)
+    month_str = f"{use_dt.month:02d}"
+    return month_str, year
+
+def _find_existing_key(bucket, prefix, filename):
+    # Prefer exact path, else check one-level subfolders
+    direct = f"{prefix}{filename}"
     try:
-        css = CSS(string="@page { size: A4; margin: 12mm }")
-        with tempfile.NamedTemporaryFile(suffix=".pdf", dir="/tmp", delete=False) as tmp:
-            HTML(string=html, base_url="/").write_pdf(tmp.name, stylesheets=[css])
-            pdf_path = tmp.name
-        with open(pdf_path, "rb") as fh:
-            s3.put_object(Bucket=DEST_BUCKET, Key=out_pdf, Body=fh.read(),
-                          ContentType="application/pdf")
-        log.info("[pdf] uploaded -> s3://%s/%s", DEST_BUCKET, out_pdf)
-        return {"statusCode": 200, "headers": {"Content-Type": "application/json"},
-                "body": json.dumps({"ok": True,
-                                    "html_uri": f"s3://{DEST_BUCKET}/{out_html}",
-                                    "pdf_uri":  f"s3://{DEST_BUCKET}/{out_pdf}"})}
-    except Exception as e:
-        log.exception("PDF generation failed")
-        return _err(500, f"PDF generation failed: {e}")
+        s3.head_object(Bucket=bucket, Key=direct)
+        return direct
+    except ClientError:
+        pass
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            k = obj.get("Key", "")
+            if k.endswith(f"/{filename}") or k == direct:
+                return k
+    return None
+
+def _want_debug(event):
+    qs = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
+    dv = (qs.get("debug") or (event.get("debug") if isinstance(event, dict) else "") or "").strip().lower()
+    return dv in ("1", "true", "yes")
+
+def _error(code, message):
+    print(f"[error] {message}")
+    return {"statusCode": code, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"error": message})}
