@@ -1,4 +1,3 @@
-# Lambda base (Amazon Linux 2023, Python 3.12)
 FROM public.ecr.aws/lambda/python:3.12
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -11,15 +10,22 @@ RUN dnf install -y \
       xorg-x11-fonts-Type1 xorg-x11-fonts-75dpi \
   && dnf clean all
 
-# Python deps
+# Upgrade pip tooling to avoid picking an older wheel from base
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Python deps (no cache; pin exact)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Verify versions at build time (prints into build logs)
+# Verify at build-time what will be imported at runtime
 RUN python - <<'PY'
-import weasyprint, pydyf, sys
-print("VERIFY at build: weasyprint", weasyprint.__version__)
-print("VERIFY at build: pydyf", pydyf.__version__)
+import sys, inspect
+print("=== BUILD VERIFY ===")
+print("sys.path =", sys.path)
+import weasyprint, pydyf
+print("weasyprint", weasyprint.__version__)
+print("pydyf", pydyf.__version__)
+print("pydyf.PDF.__init__ signature:", inspect.signature(pydyf.PDF.__init__))
 PY
 
 # Function code
