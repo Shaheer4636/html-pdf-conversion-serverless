@@ -1,3 +1,7 @@
 boto3
 botocore
 playwright==1.45.0
+
+
+
+#myrequirements
