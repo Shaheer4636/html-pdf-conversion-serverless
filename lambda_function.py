@@ -8,6 +8,7 @@ def _env(name, default=""):
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else v
 
+# ------- Config (env overrides allowed) -------
 BUCKET_NAME_SRC = _env("SRC_BUCKET", "lambda-output-report-000000987123")
 DEST_BUCKET     = _env("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX     = _env("BASE_PREFIX", "uptime")
@@ -20,11 +21,7 @@ ALLOW_PDF_SKIP  = _env("ALLOW_PDF_SKIP", "false").lower() in ("1","true","yes")
 DEBUG_DEFAULT   = _env("DEBUG_DEFAULT", "false").lower() in ("1","true","yes")
 
 AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
-
-# Playwright tuning
-PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "domcontentloaded")
-PW_STEP_TIMEOUT_MS = int(_env("PW_STEP_TIMEOUT_MS", "20000"))
-PLAYWRIGHT_BROWSERS_PATH = _env("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
+# ---------------------------------------------
 
 s3 = boto3.client("s3")
 
@@ -53,9 +50,7 @@ def handler(event, context):
             return _error(404, f'No "{SRC_FILE_NAME}" under s3://{BUCKET_NAME_SRC}/{prefix}')
 
         key = latest["Key"]
-        status["src_key"] = key
         print(f"[src] using: s3://{BUCKET_NAME_SRC}/{key}")
-
         obj = s3.get_object(Bucket=BUCKET_NAME_SRC, Key=key)
         html = obj["Body"].read().decode("utf-8", errors="replace")
 
@@ -63,7 +58,7 @@ def handler(event, context):
         status["html_uploaded"] = True
 
         try:
-            _render_and_upload_pdf_playwright(html, y, m)
+            _render_and_upload_pdf_weasyprint(html, y, m)
             status["pdf_uploaded"] = True
         except Exception as e:
             status["pdf_error"] = str(e)
@@ -82,7 +77,7 @@ def handler(event, context):
 def lambda_handler(event, context):
     return handler(event, context)
 
-# ---------- helpers ----------
+# -------------- Helpers -----------------
 
 def _get_debug(event):
     d = DEBUG_DEFAULT
@@ -98,11 +93,9 @@ def _resolve_month_year(event):
         v = qs.get(k); 
         if v is None and isinstance(event, dict): v = event.get(k)
         return (v or "").strip() if isinstance(v, str) else v
-
     month = (_get("month") or "auto").lower()
     year  = _get("year")
     now = datetime.now(timezone.utc)
-
     if month in ("auto",""): use_dt = now
     elif month in ("prev","previous","last"):
         use_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
@@ -111,7 +104,6 @@ def _resolve_month_year(event):
             raise ValueError('Invalid "month". Use two digits like "09", or "auto", or "prev".')
         y = int(year) if year else now.year
         use_dt = datetime(y, int(month), 1, tzinfo=timezone.utc)
-
     if not year: year = str(use_dt.year)
     m = f"{use_dt.month:02d}" if month in ("auto","prev","previous","last","") else f"{int(month):02d}"
     return m, year
@@ -137,41 +129,13 @@ def _upload_html_copy(html, y, m):
     )
     print(f"[html] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
 
-def _render_and_upload_pdf_playwright(html, y, m):
-    os.environ.setdefault("HOME", "/tmp")
-    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH)
-
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox", "--disable-dev-shm-usage",
-                "--disable-gpu", "--single-process", "--no-zygote",
-                "--disable-software-rasterizer",  # AL2 works with this combo
-            ],
-        )
-        try:
-            ctx = browser.new_context(offline=True)  # fully offline; no egress waits
-            page = ctx.new_page()
-            page.set_default_timeout(PW_STEP_TIMEOUT_MS)
-
-            # Block every request at the routing layer too (double safety)
-            page.route("**/*", lambda route: route.abort())
-
-            page.set_content(html, wait_until=PLAYWRIGHT_WAIT, timeout=PW_STEP_TIMEOUT_MS)
-            page.emulate_media(media="print")
-            pdf_path = "/tmp/uptime-report.pdf"
-            page.pdf(path=pdf_path, format="A4", print_background=True, prefer_css_page_size=True, timeout=PW_STEP_TIMEOUT_MS)
-        finally:
-            try: browser.close()
-            except Exception: pass
-
+def _render_and_upload_pdf_weasyprint(html, y, m):
+    # WeasyPrint render (no JS)
+    from weasyprint import HTML
+    pdf_path = "/tmp/uptime-report.pdf"
+    HTML(string=html, base_url="file:///tmp").write_pdf(pdf_path, presentational_hints=True)
     if not (os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0):
-        raise RuntimeError("Playwright produced no PDF output")
-
+        raise RuntimeError("WeasyPrint produced no PDF output")
     dest_key = f"{BASE_PREFIX}/{y}/{m}/{OUT_PDF_NAME}"
     with open(pdf_path, "rb") as f:
         s3.put_object(Bucket=DEST_BUCKET, Key=dest_key, Body=f.read(), ContentType="application/pdf")
@@ -200,7 +164,6 @@ def _ensure_dest_bucket_exists(bucket):
         if e.response.get("Error", {}).get("Code", "") not in ("404","NoSuchBucket","NotFound"):
             msg = e.response.get("Error", {}).get("Message", str(e))
             raise RuntimeError(f"S3 head_bucket failed for destination '{bucket}': {msg}")
-
     print(f"[cfg] creating destination bucket: {bucket} in {AWS_REGION}")
     if AWS_REGION == "us-east-1":
         s3.create_bucket(Bucket=bucket)
