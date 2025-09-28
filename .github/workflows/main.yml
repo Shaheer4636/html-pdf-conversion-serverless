@@ -11,18 +11,13 @@ on:
   workflow_dispatch:
 
 env:
-  # --- EDIT THESE FOR YOUR ACCOUNT/SETUP ---
-  AWS_REGION: us-east-1                 # your region
-  ECR_REPO: lambda-uptime-pdf           # ECR repo name (will be created if missing)
-  LAMBDA_FUNC: uptime-pdf               # existing Lambda function name
-  ARCH: x86_64                          # keep x86_64 unless you rebuild for arm64
-
-  # Lambda runtime config
+  AWS_REGION: us-east-1
+  ECR_REPO: lambda-uptime-pdf
+  LAMBDA_FUNC: uptime-pdf
+  ARCH: x86_64
   LAMBDA_MEMORY: "1536"
   LAMBDA_TIMEOUT: "120"
-  LAMBDA_EPHEMERAL: "1024"              # MB for /tmp
-
-  # App env vars passed to Lambda
+  LAMBDA_EPHEMERAL: "1024"
   SRC_BUCKET: lambda-output-report-000000987123
   DEST_BUCKET: pdf-uptime-reports-0000009
   BASE_PREFIX: uptime
@@ -40,12 +35,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Uses your repository variables (NOT secrets) as provided in your screenshot
-      - name: Configure AWS credentials (from repo variables)
+      # Map your repo variables -> standard env names (and validate)
+      - name: Normalize AWS credentials from repo variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Accept either your current names or the standard ones
+          AKI="${{ vars.AWS_ACCESS_KEYS }}"
+          SAK_STD="${{ vars.AWS_SECRET_ACCESS_KEYS }}"
+          SAK_TYPO="${{ vars.AWS_SECRECT_ACCESS_KEYS }}"
+          # Pick standard if present, else the typo name
+          SAK="${SAK_STD:-}"
+          if [ -z "$SAK" ]; then SAK="${SAK_TYPO:-}"; fi
+
+          if [ -z "${AKI:-}" ]; then
+            echo "Missing repo variable AWS_ACCESS_KEYS (Access Key ID)"; exit 1
+          fi
+          if [ -z "${SAK:-}" ]; then
+            echo "Missing repo variable AWS_SECRET_ACCESS_KEYS (or AWS_SECRECT_ACCESS_KEYS)"; exit 1
+          fi
+
+          echo "AWS_ACCESS_KEY_ID=${AKI}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${SAK}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ vars.AWS_ACCESS_KEYS }}
-          aws-secret-access-key: ${{ vars.AWS_SECRECT_ACCESS_KEYS }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure ECR repo exists
@@ -68,9 +85,7 @@ jobs:
           IMAGE_URI="${REGISTRY}/${ECR_REPO}:latest"
           IMAGE_SHA="${REGISTRY}/${ECR_REPO}:${GITHUB_SHA}"
 
-          # Build for Lambda's default x86_64
           docker build --platform linux/amd64 -t "${IMAGE_URI}" -t "${IMAGE_SHA}" .
-
           docker push "${IMAGE_URI}"
           docker push "${IMAGE_SHA}"
 
@@ -81,7 +96,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # This assumes the function already exists. If not, create it once in console.
           aws lambda update-function-code \
             --function-name "${LAMBDA_FUNC}" \
             --image-uri "${IMAGE_SHA}" \
