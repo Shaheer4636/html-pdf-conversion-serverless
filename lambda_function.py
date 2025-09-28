@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 import boto3
 from botocore.exceptions import ClientError
 
-# ====== CONFIG (env overrides) ======
+# ---------- configuration (env overrides) ----------
 def _env(name, default=""):
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else v
@@ -22,10 +22,16 @@ OUT_PDF_NAME    = "uptime-report.pdf"
 
 ALLOW_PDF_SKIP  = _env("ALLOW_PDF_SKIP", "false").lower() in ("1", "true", "yes")
 DEBUG_DEFAULT   = _env("DEBUG_DEFAULT", "false").lower() in ("1", "true", "yes")
-PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "domcontentloaded")
+PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "load")   # safer than networkidle in Lambda
 PDF_FORMAT      = _env("PDF_FORMAT", "A4")
 AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
-# ====================================
+
+# Playwright browsers are baked into the image here
+PLAYWRIGHT_BROWSERS_PATH = _env("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
+
+# Lambda limits: keep operations snappy to avoid hitting overall timeout
+PW_STEP_TIMEOUT_MS = int(_env("PW_STEP_TIMEOUT_MS", "45000"))
+# ---------------------------------------------------
 
 s3 = boto3.client("s3")
 
@@ -46,7 +52,7 @@ def handler(event, context):
         "html_uploaded": False, "pdf_uploaded": False
     }
 
-    # Log config and validate buckets (auto-create dest if missing)
+    # Log effective config and ensure buckets are usable. Create dest if missing.
     try:
         _log_cfg()
         _assert_bucket_exists(BUCKET_NAME_SRC, label="source")
@@ -55,26 +61,23 @@ def handler(event, context):
         return _error(404, str(e))
 
     try:
-        # 1) Find newest HTML
+        # 1) Pick newest source HTML
         latest = _find_latest_report(BUCKET_NAME_SRC, prefix)
         if latest is None:
-            return _error(
-                404,
-                f'No "{SRC_FILE_NAME}" found under s3://{BUCKET_NAME_SRC}/{prefix} (including subfolders).'
-            )
+            return _error(404, f'No "{SRC_FILE_NAME}" found under s3://{BUCKET_NAME_SRC}/{prefix} (including subfolders).')
 
         key = latest["Key"]
         status["src_key"] = key
-        print(f"[src] Using latest object: s3://{BUCKET_NAME_SRC}/{key}")
+        print(f"[src] using: s3://{BUCKET_NAME_SRC}/{key}")
 
         obj = s3.get_object(Bucket=BUCKET_NAME_SRC, Key=key)
         html = obj["Body"].read().decode("utf-8", errors="replace")
 
-        # 2) Save HTML copy
+        # 2) Store a copy of the HTML in DEST (helps retrieve exact source later)
         _upload_html_copy(html, year_str, month_str)
         status["html_uploaded"] = True
 
-        # 3) Render PDF using Playwright Chromium
+        # 3) Render PDF with Playwright/Chromium
         try:
             _render_and_upload_pdf_playwright(html, year_str, month_str)
             status["pdf_uploaded"] = True
@@ -85,17 +88,8 @@ def handler(event, context):
 
         # 4) Response
         if debug:
-            return {
-                "statusCode": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": json.dumps(status)
-            }
-
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
-            "body": html
-        }
+            return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(status)}
+        return {"statusCode": 200, "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}, "body": html}
 
     except ClientError as e:
         msg = e.response.get("Error", {}).get("Message", str(e))
@@ -108,7 +102,7 @@ def lambda_handler(event, context):
     return handler(event, context)
 
 
-# ---------- helpers ----------
+# ---------------- helpers ----------------
 
 def _get_debug(event):
     debug = DEBUG_DEFAULT
@@ -157,21 +151,11 @@ def _find_latest_report(bucket, prefix):
 
     latest = None
     for page in pages:
-        contents = page.get("Contents", [])
-        if not contents:
-            continue
-        candidates = []
-        for obj in contents:
+        for obj in page.get("Contents", []) or []:
             key = obj.get("Key", "")
-            if key == f"{prefix}{SRC_FILE_NAME}":
-                candidates.append(obj)
-            elif fnmatch.fnmatch(key, f"{prefix}*/{SRC_FILE_NAME}"):
-                candidates.append(obj)
-        if candidates:
-            candidates.sort(key=lambda o: o["LastModified"], reverse=True)
-            pick = candidates[0]
-            if (latest is None) or (pick["LastModified"] > latest["LastModified"]):
-                latest = pick
+            if key == f"{prefix}{SRC_FILE_NAME}" or fnmatch.fnmatch(key, f"{prefix}*/{SRC_FILE_NAME}"):
+                if (latest is None) or (obj["LastModified"] > latest["LastModified"]):
+                    latest = obj
     return latest
 
 
@@ -188,54 +172,70 @@ def _upload_html_copy(html, year_str, month_str):
     except ClientError as e:
         msg = e.response.get("Error", {}).get("Message", str(e))
         raise RuntimeError(f"Writing HTML to s3://{DEST_BUCKET}/{dest_key} failed: {msg}")
-    print(f"[html] Uploaded HTML -> s3://{DEST_BUCKET}/{dest_key}")
+    print(f"[html] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
 
 
 def _render_and_upload_pdf_playwright(html, year_str, month_str):
     """
-    Render HTML to PDF using Playwright/Chromium in Lambda.
-    Forces a stable headless setup (no GPU, single process) and writable font cache.
+    Stable Playwright/Chromium launch for Lambda.
+    - Runs fully headless, no GPU, single process
+    - Uses /tmp for caches (fontconfig etc.)
+    - Tight per-step timeouts to avoid whole-function timeouts
     """
-    import os
+    import shutil
     from playwright.sync_api import sync_playwright
 
-    # Make fontconfig + Chromium caches writable in Lambda
+    # Writable caches for fontconfig & Chromium
     os.makedirs("/tmp/.cache", exist_ok=True)
     os.environ.setdefault("HOME", "/tmp")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
     os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
     os.environ.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH)
 
     launch_args = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
+        "--no-sandbox", "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--disable-accelerated-2d-canvas",
-        "--disable-webgl",
-        "--no-zygote",
-        "--single-process",
-        "--headless=new",            # force new headless to avoid old-headless glitches
-        "--export-tagged-pdf",       # needed for page.pdf
+        "--disable-gpu", "--disable-software-rasterizer",
+        "--disable-accelerated-2d-canvas", "--disable-webgl",
+        "--no-zygote", "--single-process",
+        "--headless=new",
+        "--export-tagged-pdf",
     ]
 
     pdf_path = "/tmp/uptime-report.pdf"
+    # Clean any leftover file
+    try:
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+    except OSError:
+        pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=launch_args)
         try:
-            page = browser.new_page()
-            page.set_content(html, wait_until=PLAYWRIGHT_WAIT)
-            page.pdf(path=pdf_path, print_background=True, format=PDF_FORMAT)
+            ctx = browser.new_context()
+            page = ctx.new_page()
+            page.set_default_timeout(PW_STEP_TIMEOUT_MS)
+
+            # Set content and render quickly. If your HTML references external
+            # assets and Lambda has no egress, 'load' is safer than 'networkidle'.
+            page.set_content(html, wait_until=PLAYWRIGHT_WAIT, timeout=PW_STEP_TIMEOUT_MS)
+            page.emulate_media(media="print")
+            page.pdf(
+                path=pdf_path,
+                print_background=True,
+                format=PDF_FORMAT,
+                prefer_css_page_size=True,
+                timeout=PW_STEP_TIMEOUT_MS
+            )
         finally:
-            # ensure chromium really closes; avoids “target closed” races
             try:
                 browser.close()
             except Exception:
                 pass
 
-    if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+    if not (os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0):
         raise RuntimeError("Playwright produced no PDF output")
 
     dest_key = f"{BASE_PREFIX}/{year_str}/{month_str}/{OUT_PDF_NAME}"
@@ -245,8 +245,7 @@ def _render_and_upload_pdf_playwright(html, year_str, month_str):
     except ClientError as e:
         msg = e.response.get("Error", {}).get("Message", str(e))
         raise RuntimeError(f"Writing PDF to s3://{DEST_BUCKET}/{dest_key} failed: {msg}")
-    print(f"[pdf] Uploaded PDF -> s3://{DEST_BUCKET}/{dest_key}")
-
+    print(f"[pdf] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
 
 
 def _assert_bucket_exists(bucket, label="bucket"):
@@ -255,33 +254,27 @@ def _assert_bucket_exists(bucket, label="bucket"):
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         msg  = e.response.get("Error", {}).get("Message", str(e))
-        # 404/NoSuchBucket: it truly doesn't exist
         if code in ("404", "NoSuchBucket", "NotFound"):
             raise RuntimeError(f"{label.capitalize()} bucket '{bucket}' does not exist.")
-        # 301/PermanentRedirect: exists in a different region
         if code in ("301", "PermanentRedirect"):
             raise RuntimeError(f"{label.capitalize()} bucket '{bucket}' exists in a different region than {AWS_REGION}.")
-        # 403/AccessDenied: exists but not allowed
         if code in ("403", "AccessDenied"):
             raise RuntimeError(f"Access denied to {label} bucket '{bucket}'.")
         raise RuntimeError(f"S3 head_bucket failed for '{bucket}': {code} {msg}")
 
 
 def _ensure_dest_bucket_exists(bucket):
-    # If it exists, we’re done.
     try:
         s3.head_bucket(Bucket=bucket)
-        print(f"[cfg] Destination bucket exists: {bucket}")
+        print(f"[cfg] dest bucket ok: {bucket}")
         return
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code not in ("404", "NoSuchBucket", "NotFound"):
-            # Some other problem (permissions/region mismatch) — surface it.
             msg = e.response.get("Error", {}).get("Message", str(e))
             raise RuntimeError(f"S3 head_bucket failed for destination '{bucket}': {code} {msg}")
 
-    # Create the bucket now (name appears unused globally)
-    print(f"[cfg] Creating destination bucket: {bucket} in region {AWS_REGION}")
+    print(f"[cfg] creating destination bucket: {bucket} in {AWS_REGION}")
     try:
         if AWS_REGION == "us-east-1":
             s3.create_bucket(Bucket=bucket)
@@ -293,7 +286,7 @@ def _ensure_dest_bucket_exists(bucket):
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         msg  = e.response.get("Error", {}).get("Message", str(e))
-        raise RuntimeError(f"Failed to create destination bucket '{bucket}' in {AWS_REGION}: {code} {msg}")
+        raise RuntimeError(f"Failed to create bucket '{bucket}' in {AWS_REGION}: {code} {msg}")
 
 
 def _log_cfg():
@@ -302,8 +295,4 @@ def _log_cfg():
 
 def _error(code, message):
     print(f"[error] {message}")
-    return {
-        "statusCode": code,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({"error": message})
-    }
+    return {"statusCode": code, "headers": {"Content-Type": "application/json"}, "body": json.dumps({"error": message})}
