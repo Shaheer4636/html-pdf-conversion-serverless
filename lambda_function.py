@@ -184,47 +184,38 @@ def _upload_html_copy(html, year_str, month_str):
 
 def _find_chromium_binary():
     """
-    Locate the Chromium executable installed by Playwright.
-    Typically: /ms-playwright/chromium-XXXX/chrome-linux/chrome
+    Prefer headless_shell if available (no GPU process). Otherwise chrome.
     """
     base = PLAYWRIGHT_BROWSERS_PATH or "/ms-playwright"
-    patterns = [
-        os.path.join(base, "chromium-*", "chrome-linux", "chrome"),
+    # Try headless_shell first
+    for pat in (
         os.path.join(base, "chromium-*", "chrome-linux", "headless_shell"),
-    ]
-    matches = []
-    for pat in patterns:
-        matches.extend(glob.glob(pat))
-    for path in matches:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
+        os.path.join(base, "chromium-*", "chrome-linux", "chrome"),
+    ):
+        for path in glob.glob(pat):
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                print(f"[pdf] using binary: {path}")
+                return path
     raise RuntimeError(f"Chromium binary not found under {base}")
-
 
 def _render_pdf_with_chromium_cli_and_upload(html, year_str, month_str):
     """
-    Render PDF using Chromium command-line. This avoids any Playwright hangs.
-    Steps:
-      - write HTML to /tmp/in.html
-      - run chromium --headless=new --print-to-pdf=/tmp/out.pdf file:///tmp/in.html
-      - upload PDF to S3
+    Render PDF via Chromium CLI with flags tuned for Lambda:
+    - prefer headless_shell
+    - if chrome is used, force old headless and disable GPU pipelines
     """
     os.makedirs("/tmp/.cache", exist_ok=True)
-    # Writable caches for fontconfig & Chromium
     env = os.environ.copy()
     env.setdefault("HOME", "/tmp")
     env.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
+    env.setdefault("XDG_RUNTIME_DIR", "/tmp")
     env.setdefault("FONTCONFIG_PATH", "/etc/fonts")
     env.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
 
     html_path = "/tmp/in.html"
     pdf_path  = "/tmp/uptime-report.pdf"
-
-    # write HTML
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
-
-    # ensure no stale file
     try:
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
@@ -234,26 +225,41 @@ def _render_pdf_with_chromium_cli_and_upload(html, year_str, month_str):
     chrome = _find_chromium_binary()
     url = f"file://{html_path}"
 
-    cmd = [
-        chrome,
-        "--headless=new",
+    # Base flags for both chrome and headless_shell
+    base_flags = [
         "--no-sandbox",
-        "--disable-gpu",
         "--disable-dev-shm-usage",
+        "--no-zygote",
+        "--disable-extensions",
         "--disable-software-rasterizer",
         "--disable-accelerated-2d-canvas",
         "--disable-webgl",
-        "--no-first-run",
-        "--no-zygote",
+        "--disable-features=BackForwardCache",
+        "--font-render-hinting=none",
         f"--print-to-pdf={pdf_path}",
         "--print-to-pdf-no-header",
-        url,
     ]
-    # run with a hard timeout so we never exceed Lambda timeout
+
+    # Extra flags when running chrome (not headless_shell)
+    chrome_only_flags = [
+        "--headless=old",  # old headless is more stable on Lambda
+        "--disable-gpu",
+        "--use-gl=swiftshader",
+        "--disable-features=VizDisplayCompositor,UseSkiaRenderer",
+        "--no-first-run",
+    ]
+
+    cmd = [chrome] + base_flags + (chrome_only_flags if chrome.endswith("/chrome") else []) + [url]
+    print(f"[pdf] exec: {' '.join(cmd)}")
+
     try:
         completed = subprocess.run(
-            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=CHROME_TIMEOUT_SEC, check=False
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=CHROME_TIMEOUT_SEC,   # default 90s; adjust via env if needed
+            check=False,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Chromium CLI timed out after {CHROME_TIMEOUT_SEC}s")
@@ -267,12 +273,8 @@ def _render_pdf_with_chromium_cli_and_upload(html, year_str, month_str):
         raise RuntimeError("Chromium produced no PDF output")
 
     dest_key = f"{BASE_PREFIX}/{year_str}/{month_str}/{OUT_PDF_NAME}"
-    try:
-        with open(pdf_path, "rb") as f:
-            s3.put_object(Bucket=DEST_BUCKET, Key=dest_key, Body=f.read(), ContentType="application/pdf")
-    except ClientError as e:
-        msg = e.response.get("Error", {}).get("Message", str(e))
-        raise RuntimeError(f"Writing PDF to s3://{DEST_BUCKET}/{dest_key} failed: {msg}")
+    with open(pdf_path, "rb") as f:
+        s3.put_object(Bucket=DEST_BUCKET, Key=dest_key, Body=f.read(), ContentType="application/pdf")
     print(f"[pdf] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
 
 
