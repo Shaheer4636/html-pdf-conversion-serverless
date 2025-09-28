@@ -26,6 +26,13 @@ AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
 s3 = boto3.client("s3")
 
 def handler(event, context):
+    # Log weasyprint/pydyf versions at runtime for sanity
+    try:
+        import weasyprint, pydyf
+        print(f"[versions] weasyprint={weasyprint.__version__} pydyf={pydyf.__version__}")
+    except Exception as e:
+        print(f"[versions] failed to import/inspect: {e}")
+
     debug = _get_debug(event)
     try:
         m, y = _resolve_month_year(event)
@@ -138,7 +145,6 @@ def _render_and_upload_pdf_weasyprint(html, y, m):
     os.environ.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
 
     from weasyprint import HTML
-    # If your HTML uses relative URLs (e.g., <img src="...">), set base_url to a directory
     pdf_path = "/tmp/uptime-report.pdf"
     HTML(string=html, base_url="/tmp").write_pdf(target=pdf_path)
 
