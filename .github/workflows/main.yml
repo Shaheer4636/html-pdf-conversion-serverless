@@ -13,7 +13,7 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPO: lambda-uptime-pdf
-  LAMBDA_FUNC: html_to_pdf_lambda_function   # existing function name
+  LAMBDA_FUNC: html_to_pdf_lambda_function
   ARCH: x86_64
 
   # Lambda runtime config
@@ -35,7 +35,6 @@ jobs:
     permissions:
       contents: read
 
-    # Read your repository variables
     env:
       AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
       SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
@@ -77,7 +76,6 @@ jobs:
           IMAGE_LATEST="${REGISTRY}/${ECR_REPO}:latest"
           IMAGE_SHA="${REGISTRY}/${ECR_REPO}:${GITHUB_SHA}"
 
-          # Build for Lambda's default x86_64
           docker build --platform linux/amd64 -t "${IMAGE_LATEST}" -t "${IMAGE_SHA}" .
           docker push "${IMAGE_LATEST}"
           docker push "${IMAGE_SHA}"
@@ -118,6 +116,7 @@ jobs:
               PDF_FORMAT=${PDF_FORMAT}
             }" \
             --region "${AWS_REGION}"
+          echo "JUST_CREATED=1" >> $GITHUB_ENV
 
       # If current function is Zip, delete and recreate as container (same name)
       - name: Recreate ZIP function as container (same name)
@@ -143,8 +142,9 @@ jobs:
               PDF_FORMAT=${PDF_FORMAT}
             }" \
             --region "${AWS_REGION}"
+          echo "JUST_CREATED=1" >> $GITHUB_ENV
 
-      # If already container, just update code to new image
+      # If already container, just update to new image
       - name: Update code (container)
         if: steps.pkg.outputs.pkgType == 'Image'
         run: |
@@ -153,30 +153,44 @@ jobs:
             --function-name "${LAMBDA_FUNC}" \
             --image-uri "${IMAGE_SHA}" \
             --region "${AWS_REGION}"
+          echo "JUST_UPDATED_CODE=1" >> $GITHUB_ENV
 
-      - name: Wait until function is active
+      # Robust readiness waiters after create/recreate or code update
+      - name: Wait until function is ready
         run: |
           set -euo pipefail
+          # Wait for Active
           aws lambda wait function-active --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}"
+          # Wait for Updated (handles "update in progress" conflicts)
+          aws lambda wait function-updated --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}"
+          # Small buffer
+          sleep 5
 
-      # Update env/memory/timeout (no --architectures here)
+      # Update env/memory/timeout with retries to avoid ResourceConflict
       - name: Update configuration (env/memory/timeout)
         run: |
           set -euo pipefail
-          aws lambda update-function-configuration \
-            --function-name "${LAMBDA_FUNC}" \
-            --timeout "${LAMBDA_TIMEOUT}" \
-            --memory-size "${LAMBDA_MEMORY}" \
-            --ephemeral-storage '{"Size": '"${LAMBDA_EPHEMERAL}"'}' \
-            --environment "Variables={
-              SRC_BUCKET=${SRC_BUCKET},
-              DEST_BUCKET=${DEST_BUCKET},
-              BASE_PREFIX=${BASE_PREFIX},
-              ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
-              PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
-              PDF_FORMAT=${PDF_FORMAT}
-            }" \
-            --region "${AWS_REGION}"
+          for i in $(seq 1 10); do
+            if aws lambda update-function-configuration \
+              --function-name "${LAMBDA_FUNC}" \
+              --timeout "${LAMBDA_TIMEOUT}" \
+              --memory-size "${LAMBDA_MEMORY}" \
+              --ephemeral-storage '{"Size": '"${LAMBDA_EPHEMERAL}"'}' \
+              --environment "Variables={
+                SRC_BUCKET=${SRC_BUCKET},
+                DEST_BUCKET=${DEST_BUCKET},
+                BASE_PREFIX=${BASE_PREFIX},
+                ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
+                PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
+                PDF_FORMAT=${PDF_FORMAT}
+              }" \
+              --region "${AWS_REGION}"; then
+              echo "Config updated."; break
+            else
+              echo "Config update attempt $i failed; waiting and retrying..."
+              sleep $((3*i))
+            fi
+          done
 
       - name: Wait for configuration to apply
         run: |
