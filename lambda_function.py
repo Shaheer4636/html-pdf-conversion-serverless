@@ -8,37 +8,29 @@ import boto3
 from botocore.exceptions import ClientError
 
 # ====== CONFIG (env overrides) ======
-BUCKET_NAME_SRC = os.getenv("SRC_BUCKET", "lambda-output-report-000000987123")
-DEST_BUCKET     = os.getenv("DEST_BUCKET", "pdf-uptime-reports-0000009")
-BASE_PREFIX     = os.getenv("BASE_PREFIX", "uptime")
+def _env(name, default=""):
+    v = os.getenv(name, default)
+    return v.strip() if isinstance(v, str) else v
 
-SRC_FILE_NAME   = "uptime-report.html"   # file to find in source
-OUT_HTML_NAME   = "uptime-report.html"   # HTML name on destination
-OUT_PDF_NAME    = "uptime-report.pdf"    # PDF name on destination
+BUCKET_NAME_SRC = _env("SRC_BUCKET", "lambda-output-report-000000987123")
+DEST_BUCKET     = _env("DEST_BUCKET", "pdf-uptime-reports-0000009")
+BASE_PREFIX     = _env("BASE_PREFIX", "uptime")
 
-# Behavior toggles
-ALLOW_PDF_SKIP  = os.getenv("ALLOW_PDF_SKIP", "false").lower() in ("1","true","yes")
-DEBUG_DEFAULT   = os.getenv("DEBUG_DEFAULT", "false").lower() in ("1","true","yes")
-PLAYWRIGHT_WAIT = os.getenv("PLAYWRIGHT_WAIT", "domcontentloaded")
-PDF_FORMAT      = os.getenv("PDF_FORMAT", "A4")
+SRC_FILE_NAME   = "uptime-report.html"
+OUT_HTML_NAME   = "uptime-report.html"
+OUT_PDF_NAME    = "uptime-report.pdf"
+
+ALLOW_PDF_SKIP  = _env("ALLOW_PDF_SKIP", "false").lower() in ("1", "true", "yes")
+DEBUG_DEFAULT   = _env("DEBUG_DEFAULT", "false").lower() in ("1", "true", "yes")
+PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "domcontentloaded")
+PDF_FORMAT      = _env("PDF_FORMAT", "A4")
+AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
 # ====================================
 
 s3 = boto3.client("s3")
 
 
 def handler(event, context):
-    """
-    Inputs:
-      - Query string: ?month=09&year=2025[&debug=1]
-      - Event JSON:   {"month":"09","year":"2025","debug":1}
-      - month=auto (default), month=prev supported
-
-    Flow:
-      1) Read newest uptime/<year>/<month>/**/uptime-report.html from source bucket.
-      2) Upload HTML copy to s3://DEST_BUCKET/uptime/<year>/<month>/uptime-report.html
-      3) Render to PDF (Playwright Chromium) and upload to .../uptime-report.pdf
-      4) Return HTML (or JSON status if debug=1).
-    """
     debug = _get_debug(event)
 
     try:
@@ -54,11 +46,11 @@ def handler(event, context):
         "html_uploaded": False, "pdf_uploaded": False
     }
 
-    # Log effective config and hard-fail if buckets are wrong
+    # Log config and validate buckets (auto-create dest if missing)
     try:
         _log_cfg()
-        _head_bucket_or_raise(BUCKET_NAME_SRC)
-        _head_bucket_or_raise(DEST_BUCKET)
+        _assert_bucket_exists(BUCKET_NAME_SRC, label="source")
+        _ensure_dest_bucket_exists(DEST_BUCKET)
     except RuntimeError as e:
         return _error(404, str(e))
 
@@ -112,7 +104,7 @@ def handler(event, context):
         return _error(500, f"Unhandled error: {str(e)}")
 
 
-def lambda_handler(event, context):  # console entrypoint
+def lambda_handler(event, context):
     return handler(event, context)
 
 
@@ -160,11 +152,6 @@ def _resolve_month_year(event):
 
 
 def _find_latest_report(bucket, prefix):
-    """
-    Returns the newest object dict for:
-      - {prefix}/uptime-report.html
-      - {prefix}*/uptime-report.html   (one more subdirectory)
-    """
     paginator = s3.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
 
@@ -205,9 +192,6 @@ def _upload_html_copy(html, year_str, month_str):
 
 
 def _render_and_upload_pdf_playwright(html, year_str, month_str):
-    """
-    Uses Playwright (Chromium) bundled in the container image to render the HTML and save as PDF.
-    """
     from playwright.sync_api import sync_playwright
 
     pdf_path = "/tmp/uptime-report.pdf"
@@ -231,17 +215,55 @@ def _render_and_upload_pdf_playwright(html, year_str, month_str):
     print(f"[pdf] Uploaded PDF -> s3://{DEST_BUCKET}/{dest_key}")
 
 
-def _head_bucket_or_raise(bucket):
+def _assert_bucket_exists(bucket, label="bucket"):
     try:
         s3.head_bucket(Bucket=bucket)
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         msg  = e.response.get("Error", {}).get("Message", str(e))
+        # 404/NoSuchBucket: it truly doesn't exist
+        if code in ("404", "NoSuchBucket", "NotFound"):
+            raise RuntimeError(f"{label.capitalize()} bucket '{bucket}' does not exist.")
+        # 301/PermanentRedirect: exists in a different region
+        if code in ("301", "PermanentRedirect"):
+            raise RuntimeError(f"{label.capitalize()} bucket '{bucket}' exists in a different region than {AWS_REGION}.")
+        # 403/AccessDenied: exists but not allowed
+        if code in ("403", "AccessDenied"):
+            raise RuntimeError(f"Access denied to {label} bucket '{bucket}'.")
         raise RuntimeError(f"S3 head_bucket failed for '{bucket}': {code} {msg}")
 
 
+def _ensure_dest_bucket_exists(bucket):
+    # If it exists, we’re done.
+    try:
+        s3.head_bucket(Bucket=bucket)
+        print(f"[cfg] Destination bucket exists: {bucket}")
+        return
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code not in ("404", "NoSuchBucket", "NotFound"):
+            # Some other problem (permissions/region mismatch) — surface it.
+            msg = e.response.get("Error", {}).get("Message", str(e))
+            raise RuntimeError(f"S3 head_bucket failed for destination '{bucket}': {code} {msg}")
+
+    # Create the bucket now (name appears unused globally)
+    print(f"[cfg] Creating destination bucket: {bucket} in region {AWS_REGION}")
+    try:
+        if AWS_REGION == "us-east-1":
+            s3.create_bucket(Bucket=bucket)
+        else:
+            s3.create_bucket(
+                Bucket=bucket,
+                CreateBucketConfiguration={"LocationConstraint": AWS_REGION}
+            )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        msg  = e.response.get("Error", {}).get("Message", str(e))
+        raise RuntimeError(f"Failed to create destination bucket '{bucket}' in {AWS_REGION}: {code} {msg}")
+
+
 def _log_cfg():
-    print(f"[cfg] SRC_BUCKET={BUCKET_NAME_SRC!r} DEST_BUCKET={DEST_BUCKET!r} BASE_PREFIX={BASE_PREFIX!r}")
+    print(f"[cfg] SRC_BUCKET={BUCKET_NAME_SRC!r} DEST_BUCKET={DEST_BUCKET!r} BASE_PREFIX={BASE_PREFIX!r} REGION={AWS_REGION!r}")
 
 
 def _error(code, message):
