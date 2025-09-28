@@ -1,2 +1,10 @@
 boto3
+
+# WeasyPrint stack (pin to avoid the PDF.__init__ mismatch)
 weasyprint==61.2
+pydyf==0.11.0
+tinycss2==1.2.1
+cssselect2==0.7.0
+cairocffi>=1.6.1
+cffi>=1.15.1
+Pillow>=10.3.0
