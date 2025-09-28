@@ -1,16 +1,19 @@
+# lambda_function.py
 import json
 import fnmatch
 import os
+import glob
+import subprocess
 from datetime import datetime, timezone, timedelta
 
 import boto3
 from botocore.exceptions import ClientError
 
+# ---------- configuration (env overrides) ----------
 def _env(name, default=""):
     v = os.getenv(name, default)
     return v.strip() if isinstance(v, str) else v
 
-# --------- config (env overrides) -----
 BUCKET_NAME_SRC = _env("SRC_BUCKET", "lambda-output-report-000000987123")
 DEST_BUCKET     = _env("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX     = _env("BASE_PREFIX", "uptime")
@@ -22,20 +25,19 @@ OUT_PDF_NAME    = "uptime-report.pdf"
 ALLOW_PDF_SKIP  = _env("ALLOW_PDF_SKIP", "false").lower() in ("1", "true", "yes")
 DEBUG_DEFAULT   = _env("DEBUG_DEFAULT", "false").lower() in ("1", "true", "yes")
 
-# CRUCIAL: do not wait for 3rd-party assets; Lambda often has no egress
-PLAYWRIGHT_WAIT = _env("PLAYWRIGHT_WAIT", "domcontentloaded")
-PDF_FORMAT      = _env("PDF_FORMAT", "A4")
 AWS_REGION      = _env("AWS_REGION", _env("AWS_DEFAULT_REGION", "us-east-1"))
-PW_STEP_TIMEOUT_MS = int(_env("PW_STEP_TIMEOUT_MS", "20000"))  # 20s per step
-
 PLAYWRIGHT_BROWSERS_PATH = _env("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
-# ------------------------------------------
+
+# CLI rendering limits
+CHROME_TIMEOUT_SEC = int(_env("CHROME_TIMEOUT_SEC", "90"))   # hard timeout for the chromium process
+# ---------------------------------------------------
 
 s3 = boto3.client("s3")
 
 
 def handler(event, context):
     debug = _get_debug(event)
+
     try:
         month_str, year_str = _resolve_month_year(event)
     except ValueError as ve:
@@ -57,6 +59,7 @@ def handler(event, context):
         return _error(404, str(e))
 
     try:
+        # 1) Find newest report html
         latest = _find_latest_report(BUCKET_NAME_SRC, prefix)
         if latest is None:
             return _error(404, f'No "{SRC_FILE_NAME}" found under s3://{BUCKET_NAME_SRC}/{prefix} (including subfolders).')
@@ -68,20 +71,31 @@ def handler(event, context):
         obj = s3.get_object(Bucket=BUCKET_NAME_SRC, Key=key)
         html = obj["Body"].read().decode("utf-8", errors="replace")
 
+        # 2) Store HTML copy in destination
         _upload_html_copy(html, year_str, month_str)
         status["html_uploaded"] = True
 
+        # 3) Render PDF via Chromium CLI (no Playwright event loop)
         try:
-            _render_and_upload_pdf_playwright(html, year_str, month_str)
+            _render_pdf_with_chromium_cli_and_upload(html, year_str, month_str)
             status["pdf_uploaded"] = True
         except Exception as e:
             status["pdf_error"] = str(e)
             if not ALLOW_PDF_SKIP:
                 return _error(500, f"PDF generation failed: {e}")
 
+        # 4) Return
         if debug:
-            return {"statusCode": 200, "headers": {"Content-Type": "application/json"}, "body": json.dumps(status)}
-        return {"statusCode": 200, "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}, "body": html}
+            return {
+                "statusCode": 200,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps(status)
+            }
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
+            "body": html
+        }
 
     except ClientError as e:
         msg = e.response.get("Error", {}).get("Message", str(e))
@@ -94,7 +108,7 @@ def lambda_handler(event, context):
     return handler(event, context)
 
 
-# ------------- helpers -------------
+# ---------------- helpers ----------------
 
 def _get_debug(event):
     debug = DEBUG_DEFAULT
@@ -140,11 +154,13 @@ def _resolve_month_year(event):
 def _find_latest_report(bucket, prefix):
     paginator = s3.get_paginator("list_objects_v2")
     pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+
     latest = None
     for page in pages:
-        for obj in page.get("Contents", []) or []:
-            k = obj.get("Key", "")
-            if k == f"{prefix}{SRC_FILE_NAME}" or fnmatch.fnmatch(k, f"{prefix}*/{SRC_FILE_NAME}"):
+        contents = page.get("Contents", []) or []
+        for obj in contents:
+            key = obj.get("Key", "")
+            if key == f"{prefix}{SRC_FILE_NAME}" or fnmatch.fnmatch(key, f"{prefix}*/{SRC_FILE_NAME}"):
                 if (latest is None) or (obj["LastModified"] > latest["LastModified"]):
                     latest = obj
     return latest
@@ -166,59 +182,89 @@ def _upload_html_copy(html, year_str, month_str):
     print(f"[html] uploaded -> s3://{DEST_BUCKET}/{dest_key}")
 
 
-def _render_and_upload_pdf_playwright(html, year_str, month_str):
-    import shutil
-    from playwright.sync_api import sync_playwright
-
-    os.makedirs("/tmp/.cache", exist_ok=True)
-    os.environ.setdefault("HOME", "/tmp")
-    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
-    os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
-    os.environ.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH)
-
-    launch_args = [
-        "--no-sandbox", "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu", "--disable-software-rasterizer",
-        "--disable-accelerated-2d-canvas", "--disable-webgl",
-        "--no-zygote", "--single-process",
-        "--headless=new",
-        "--export-tagged-pdf",
+def _find_chromium_binary():
+    """
+    Locate the Chromium executable installed by Playwright.
+    Typically: /ms-playwright/chromium-XXXX/chrome-linux/chrome
+    """
+    base = PLAYWRIGHT_BROWSERS_PATH or "/ms-playwright"
+    patterns = [
+        os.path.join(base, "chromium-*", "chrome-linux", "chrome"),
+        os.path.join(base, "chromium-*", "chrome-linux", "headless_shell"),
     ]
+    matches = []
+    for pat in patterns:
+        matches.extend(glob.glob(pat))
+    for path in matches:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    raise RuntimeError(f"Chromium binary not found under {base}")
 
-    pdf_path = "/tmp/uptime-report.pdf"
+
+def _render_pdf_with_chromium_cli_and_upload(html, year_str, month_str):
+    """
+    Render PDF using Chromium command-line. This avoids any Playwright hangs.
+    Steps:
+      - write HTML to /tmp/in.html
+      - run chromium --headless=new --print-to-pdf=/tmp/out.pdf file:///tmp/in.html
+      - upload PDF to S3
+    """
+    os.makedirs("/tmp/.cache", exist_ok=True)
+    # Writable caches for fontconfig & Chromium
+    env = os.environ.copy()
+    env.setdefault("HOME", "/tmp")
+    env.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
+    env.setdefault("FONTCONFIG_PATH", "/etc/fonts")
+    env.setdefault("FONTCONFIG_FILE", "/etc/fonts/fonts.conf")
+
+    html_path = "/tmp/in.html"
+    pdf_path  = "/tmp/uptime-report.pdf"
+
+    # write HTML
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    # ensure no stale file
     try:
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
     except OSError:
         pass
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=launch_args)
-        try:
-            # Block all external network so we never wait on the internet
-            ctx = browser.new_context(offline=True)
-            page = ctx.new_page()
-            page.set_default_timeout(PW_STEP_TIMEOUT_MS)
+    chrome = _find_chromium_binary()
+    url = f"file://{html_path}"
 
-            page.set_content(html, wait_until=PLAYWRIGHT_WAIT, timeout=PW_STEP_TIMEOUT_MS)
-            page.emulate_media(media="print")
-            page.pdf(
-                path=pdf_path,
-                print_background=True,
-                format=PDF_FORMAT,
-                prefer_css_page_size=True,
-                timeout=PW_STEP_TIMEOUT_MS
-            )
-        finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
+    cmd = [
+        chrome,
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-software-rasterizer",
+        "--disable-accelerated-2d-canvas",
+        "--disable-webgl",
+        "--no-first-run",
+        "--no-zygote",
+        f"--print-to-pdf={pdf_path}",
+        "--print-to-pdf-no-header",
+        url,
+    ]
+    # run with a hard timeout so we never exceed Lambda timeout
+    try:
+        completed = subprocess.run(
+            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=CHROME_TIMEOUT_SEC, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Chromium CLI timed out after {CHROME_TIMEOUT_SEC}s")
+
+    if completed.returncode != 0:
+        err = (completed.stderr or b"").decode("utf-8", errors="replace")
+        out = (completed.stdout or b"").decode("utf-8", errors="replace")
+        raise RuntimeError(f"Chromium CLI failed (exit {completed.returncode}). stderr: {err[:4000]} stdout: {out[:4000]}")
 
     if not (os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0):
-        raise RuntimeError("Playwright produced no PDF output")
+        raise RuntimeError("Chromium produced no PDF output")
 
     dest_key = f"{BASE_PREFIX}/{year_str}/{month_str}/{OUT_PDF_NAME}"
     try:
@@ -261,7 +307,10 @@ def _ensure_dest_bucket_exists(bucket):
         if AWS_REGION == "us-east-1":
             s3.create_bucket(Bucket=bucket)
         else:
-            s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": AWS_REGION})
+            s3.create_bucket(
+                Bucket=bucket,
+                CreateBucketConfiguration={"LocationConstraint": AWS_REGION}
+            )
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         msg  = e.response.get("Error", {}).get("Message", str(e))
