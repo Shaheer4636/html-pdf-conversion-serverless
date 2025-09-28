@@ -1,4 +1,4 @@
-name: Build & Deploy Lambda (Container Image)
+name: Build & Deploy Lambda (Container)
 
 on:
   push:
@@ -13,7 +13,7 @@ on:
 env:
   AWS_REGION: us-east-1
   ECR_REPO: lambda-uptime-pdf
-  LAMBDA_FUNC: html_to_pdf_lambda_function     # <-- your existing function name
+  LAMBDA_FUNC: html_to_pdf_lambda_function     # your existing function name
   ARCH: x86_64
 
   # Lambda runtime config
@@ -21,7 +21,7 @@ env:
   LAMBDA_TIMEOUT: "120"
   LAMBDA_EPHEMERAL: "1024"
 
-  # App env vars for your function
+  # App env vars (edit buckets/prefix if different)
   SRC_BUCKET: lambda-output-report-000000987123
   DEST_BUCKET: pdf-uptime-reports-0000009
   BASE_PREFIX: uptime
@@ -36,11 +36,9 @@ jobs:
       contents: read
 
     env:
-      GH_AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
-      GH_SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
+      AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
+      SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
       LAMBDA_ROLE_ARN: ${{ vars.LAMBDA_ROLE_ARN }}
-      FORCE_RECREATE: ${{ vars.FORCE_RECREATE }}
-      S3_TRIGGER_BUCKET: ${{ vars.S3_TRIGGER_BUCKET }}
 
     steps:
       - name: Checkout
@@ -49,14 +47,15 @@ jobs:
       - name: Validate repo variables
         run: |
           set -euo pipefail
-          [ -n "${GH_AKI:-}" ] || { echo "Missing repo variable AWS_ACCESS_KEY_ID"; exit 1; }
-          [ -n "${GH_SAK:-}" ] || { echo "Missing repo variable AWS_SECRET_ACCESS_KEY"; exit 1; }
+          [ -n "${AKI:-}" ] || { echo "Missing repo variable AWS_ACCESS_KEY_ID"; exit 1; }
+          [ -n "${SAK:-}" ] || { echo "Missing repo variable AWS_SECRET_ACCESS_KEY"; exit 1; }
+          [ -n "${LAMBDA_ROLE_ARN:-}" ] || { echo "Missing repo variable LAMBDA_ROLE_ARN"; exit 1; }
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ env.GH_AKI }}
-          aws-secret-access-key: ${{ env.GH_SAK }}
+          aws-access-key-id: ${{ env.AKI }}
+          aws-secret-access-key: ${{ env.SAK }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Ensure ECR repo exists
@@ -92,11 +91,11 @@ jobs:
             echo "pkgType=NONE" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create function (if absent)
+      # Create if missing
+      - name: Create function (container)
         if: steps.pkg.outputs.pkgType == 'NONE'
         run: |
           set -euo pipefail
-          [ -n "${LAMBDA_ROLE_ARN:-}" ] || { echo "Function missing AND LAMBDA_ROLE_ARN not set"; exit 1; }
           aws lambda create-function \
             --function-name "${LAMBDA_FUNC}" \
             --package-type Image \
@@ -115,16 +114,12 @@ jobs:
               PDF_FORMAT=${PDF_FORMAT}
             }" \
             --region "${AWS_REGION}"
-          echo "JUST_CREATED=1" >> $GITHUB_ENV
 
-      - name: Recreate ZIP function as container (optional destructive)
+      # If current function is Zip, delete and recreate as container (same name)
+      - name: Recreate ZIP function as container (same name)
         if: steps.pkg.outputs.pkgType == 'Zip'
         run: |
           set -euo pipefail
-          if [ "${FORCE_RECREATE:-}" != "true" ]; then
-            echo "Function exists as ZIP. Set repo var FORCE_RECREATE=true to delete and recreate as container, or create a new function name."; exit 1;
-          fi
-          [ -n "${LAMBDA_ROLE_ARN:-}" ] || { echo "FORCE_RECREATE=true but LAMBDA_ROLE_ARN not set"; exit 1; }
           aws lambda delete-function --function-name "${LAMBDA_FUNC}"
           aws lambda create-function \
             --function-name "${LAMBDA_FUNC}" \
@@ -144,9 +139,9 @@ jobs:
               PDF_FORMAT=${PDF_FORMAT}
             }" \
             --region "${AWS_REGION}"
-          echo "JUST_CREATED=1" >> $GITHUB_ENV
 
-      - name: Update code (Image) when function is container
+      # If container already, just update to new image
+      - name: Update code (container)
         if: steps.pkg.outputs.pkgType == 'Image'
         run: |
           set -euo pipefail
@@ -156,7 +151,6 @@ jobs:
             --region "${AWS_REGION}"
 
       - name: Update configuration (env/memory/timeout)
-        if: steps.pkg.outputs.pkgType != 'Zip'
         run: |
           set -euo pipefail
           aws lambda update-function-configuration \
@@ -175,20 +169,7 @@ jobs:
             }" \
             --region "${AWS_REGION}"
 
-      - name: Re-add S3 invoke permission (only if created/recreated and bucket provided)
-        if: env.JUST_CREATED == '1' && env.S3_TRIGGER_BUCKET != ''
-        run: |
-          set -euo pipefail
-          aws lambda add-permission \
-            --function-name "${LAMBDA_FUNC}" \
-            --statement-id s3invoke-$(date +%s) \
-            --action lambda:InvokeFunction \
-            --principal s3.amazonaws.com \
-            --source-arn arn:aws:s3:::${S3_TRIGGER_BUCKET} \
-            --region "${AWS_REGION}" || true
-
       - name: Publish version
-        if: steps.pkg.outputs.pkgType != 'Zip'
         run: |
           set -euo pipefail
           aws lambda publish-version --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}" >/dev/null
