@@ -12,7 +12,7 @@ DEST_BUCKET = os.getenv("DEST_BUCKET")
 BASE_PREFIX = os.getenv("BASE_PREFIX", "uptime")
 PDF_FORMAT  = os.getenv("PDF_FORMAT", "A4")
 
-# Make fontconfig cache writable (gets rid of those "No writable cache" errors)
+# Make fontconfig cache writable (gets rid of those "No writable cache" erro
 os.environ.setdefault("HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
 os.makedirs("/tmp/.cache/fontconfig", exist_ok=True)
