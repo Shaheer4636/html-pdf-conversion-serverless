@@ -5,7 +5,6 @@ import tempfile
 from typing import Dict, Any, Iterable
 import boto3
 
-# -------- Config via environment variables --------
 ENV = {
     "SRC_BUCKET": os.getenv("SRC_BUCKET", ""),
     "DEST_BUCKET": os.getenv("DEST_BUCKET", ""),
