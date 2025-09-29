@@ -11,6 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m playwright install chromium
 
 # Copy your handler file into /var/task (Lambda’s working dir)
-COPY index.py .    # <— must exist next to Dockerfile
+COPY lambda_function.py .    # <— must exist next to Dockerfile
 
 CMD ["index.handler"]
