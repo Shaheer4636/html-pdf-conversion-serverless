@@ -1,40 +1,37 @@
-# Amazon Linux 2023 + Python 3.12 Lambda base
 FROM public.ecr.aws/lambda/python:3.12
 
-# Writable caches in Lambda runtime
 ENV HOME=/tmp \
     XDG_CACHE_HOME=/tmp \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PYTHONUNBUFFERED=1
 
-# ---- System libs Chromium needs on AL2023 (dnf, NOT apt) ----
+# Runtime libs Chromium needs on Amazon Linux 2023
 RUN dnf install -y \
-    # X / input / windowing
-    libX11 libXcomposite libXcursor libXdamage libXext libXi libXrandr libXrender libXScrnSaver libXtst \
-    libxkbcommon \
-    # graphics
-    libdrm mesa-libgbm \
-    # text / fonts / rendering
+    # X stack
+    libX11 libXcomposite libXcursor libXdamage libXext libXi libXrandr libXrender libXScrnSaver libXtst libxkbcommon \
+    # graphics / EGL
+    libdrm mesa-libgbm mesa-libEGL mesa-libGL \
+    # rendering / fonts
     pango cairo gdk-pixbuf2 freetype fontconfig \
-    # sound (Chromium expects it present even in headless)
+    # sound (harmless in headless)
     alsa-lib \
-    # misc
+    # security & misc
     nss nspr cups-libs dbus-libs expat glib2 zlib libjpeg-turbo libpng \
+    # accessibility
     at-spi2-core at-spi2-atk atk \
   && dnf clean all
 
-# (optional) where you can COPY custom fonts if you have them
+# (optional) custom fonts can be copied into this folder
 RUN mkdir -p /usr/share/fonts/custom && fc-cache -f
 
 # Python deps
 COPY requirements.txt /var/task/requirements.txt
 RUN pip install --no-cache-dir -r /var/task/requirements.txt
 
-# Download Chromium at build time (no network at runtime)
+# Download Chromium at build time so it’s baked into the image
 RUN python -m playwright install chromium
 
-# App code
+# Lambda handler
 COPY lambda_function.py ${LAMBDA_TASK_ROOT}/
 
-# Entrypoint
 CMD ["lambda_function.lambda_handler"]
