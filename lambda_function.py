@@ -9,7 +9,7 @@ SERVICE         = "Useful App"
 CLIENT          = "CitiBank"
 
 ONLY_BROWSER    = "ANY"       # e.g. "CHRO
-FAIL_STREAK     = 3           # minutes in a row that constitute an incident
+FAIL_STREAK     = 3           # minutes in a row that co
 TREAT_MISSING   = False       # True: missing minutes count as failures
 
 SLO_TARGET      = "auto"      # "auto" for median of last 3 full months, or a float like 99.9
