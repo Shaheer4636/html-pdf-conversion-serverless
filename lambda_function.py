@@ -7,7 +7,6 @@ from playwright.sync_api import sync_playwright
 
 s3 = boto3.client("s3")
 
-# Config via env
 SRC_BUCKET  = os.getenv("SRC_BUCKET")
 DEST_BUCKET = os.getenv("DEST_BUCKET")
 BASE_PREFIX = os.getenv("BASE_PREFIX", "uptime")
