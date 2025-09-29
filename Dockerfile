@@ -1,35 +1,38 @@
 # Amazon Linux 2023 Lambda base (Python 3.12)
 FROM public.ecr.aws/lambda/python:3.12
 
-# ---- OS libs headless Chromium needs + fonts ----
+# Make Playwright put browsers here (bundled into the image)
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# ---- OS libraries that Chromium needs (dnf, not apt) ----
 RUN dnf install -y \
-    # rendering stack
-    cairo cairo-gobject pango gdk-pixbuf2 \
+    # X / GLib stack
+    glib2 dbus-libs \
+    libX11 libXcomposite libXcursor libXdamage libXext libXi libXtst libXrandr libXfixes libXrender \
+    libdrm mesa-libgbm libxkbcommon \
+    nss nspr alsa-lib cups-libs \
+    # Text / layout (also helps with fonts)
+    pango atk at-spi2-atk \
+    # (weasyprint deps kept; harmless)
+    cairo cairo-gobject gdk-pixbuf2 fontconfig freetype harfbuzz fribidi libxml2 libxslt \
     libjpeg-turbo libpng zlib \
-    fontconfig freetype harfbuzz fribidi \
-    libxml2 libxslt \
-    # common chromium run deps
-    atk at-spi2-atk at-spi2-core cups-libs nspr nss \
-    libX11 libXcomposite libXcursor libXdamage libXext libXi libXtst \
-    libdrm mesa-libgbm \
-  && dnf clean all && rm -rf /var/cache/dnf
+    wget tar which \
+ && dnf clean all
 
 # ---- Python deps ----
 COPY requirements.txt /var/task/requirements.txt
 RUN pip install --no-cache-dir -r /var/task/requirements.txt
 
-# Make Playwright always use a fixed, baked-in path for browsers
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
-# Install the Chromium binary once at build time (goes to /ms-playwright)
+# ---- Download the Chromium binary now (no downloads at runtime) ----
 RUN python -m playwright install chromium
 
-# Writable font cache for fontconfig at runtime (kept in /tmp)
+# Writable cache for fontconfig at runtime
 ENV XDG_CACHE_HOME=/tmp/fontcache
-RUN mkdir -p /tmp/fontcache && chmod 777 /tmp/fontcache
+RUN mkdir -p /tmp/fontcache && chmod -R 777 /tmp/fontcache
 
-# ---- App code ----
+# Your handler
 COPY lambda_function.py /var/task/
 
-# Lambda entry
 CMD ["lambda_function.lambda_handler"]
