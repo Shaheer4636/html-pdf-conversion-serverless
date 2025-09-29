@@ -1,38 +1,40 @@
-# Lambda base (Amazon Linux 2023, Python 3.12)
+# Amazon Linux 2023 + Python 3.12 Lambda base
 FROM public.ecr.aws/lambda/python:3.12
 
-# Keep browser in a fixed, read-only path
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PYTHONUNBUFFERED=1 \
-    HOME=/tmp \
-    XDG_CACHE_HOME=/tmp
+# Writable caches in Lambda runtime
+ENV HOME=/tmp \
+    XDG_CACHE_HOME=/tmp \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PYTHONUNBUFFERED=1
 
-# --- System libraries Chromium needs on AL2023 ---
+# ---- System libs Chromium needs on AL2023 (dnf, NOT apt) ----
 RUN dnf install -y \
-    at-spi2-atk at-spi2-core atk \
-    alsa-lib \
-    cairo pango gdk-pixbuf2 \
-    cups-libs dbus-libs expat glib2 \
-    libX11 libXcomposite libXcursor libXdamage libXext \
-    libXi libXrandr libXrender libXScrnSaver libXtst \
+    # X / input / windowing
+    libX11 libXcomposite libXcursor libXdamage libXext libXi libXrandr libXrender libXScrnSaver libXtst \
+    libxkbcommon \
+    # graphics
     libdrm mesa-libgbm \
-    nss nspr \
-    freetype fontconfig \
-    libjpeg-turbo libpng zlib \
+    # text / fonts / rendering
+    pango cairo gdk-pixbuf2 freetype fontconfig \
+    # sound (Chromium expects it present even in headless)
+    alsa-lib \
+    # misc
+    nss nspr cups-libs dbus-libs expat glib2 zlib libjpeg-turbo libpng \
+    at-spi2-core at-spi2-atk atk \
   && dnf clean all
 
-# Optional: a place for custom fonts (won’t fail if empty)
-RUN mkdir -p /usr/share/fonts/custom
+# (optional) where you can COPY custom fonts if you have them
+RUN mkdir -p /usr/share/fonts/custom && fc-cache -f
 
 # Python deps
 COPY requirements.txt /var/task/requirements.txt
 RUN pip install --no-cache-dir -r /var/task/requirements.txt
 
-# Download Chromium once at build-time (no apt, just the browser files)
+# Download Chromium at build time (no network at runtime)
 RUN python -m playwright install chromium
 
 # App code
 COPY lambda_function.py ${LAMBDA_TASK_ROOT}/
 
-# Lambda entrypoint
+# Entrypoint
 CMD ["lambda_function.lambda_handler"]
