@@ -1,217 +1,132 @@
-# lambda_function.py
-# HTML → PDF in Lambda using Playwright (Chromium)
-# - Reads latest src HTML from S3 under uptime/<year>/<month>/.../uptime-report.html
-# - Copies HTML to dest bucket
-# - Renders PDF with headless Chromium and uploads to dest bucket
-# - Supports ?month=09&year=2025&debug=1 (also works with event JSON)
-#
-# Required in the container image:
-#   pip install playwright==1.46.*
-#   python -m playwright install chromium
-# Plus OS libs (already in your Dockerfile for AL2023).
-
-import json
 import os
-import fnmatch
-from datetime import datetime, timezone, timedelta
-
+import json
+import re
+import tempfile
+from typing import Dict, Any, Iterable
 import boto3
-from botocore.exceptions import ClientError
 
-# ---------- config (env overrides) ----------
-SRC_BUCKET   = os.getenv("SRC_BUCKET",   "lambda-output-report-000000987123")
-DEST_BUCKET  = os.getenv("DEST_BUCKET",  "pdf-uptime-reports-0000009")
-BASE_PREFIX  = os.getenv("BASE_PREFIX",  "uptime")
+# -------- Config via environment variables --------
+ENV = {
+    "SRC_BUCKET": os.getenv("SRC_BUCKET", ""),
+    "DEST_BUCKET": os.getenv("DEST_BUCKET", ""),
+    "BASE_PREFIX": os.getenv("BASE_PREFIX", "uptime"),
+    "PDF_FORMAT": os.getenv("PDF_FORMAT", "A4"),
+    # page load wait: "load" | "domcontentloaded" | "networkidle"
+    "PLAYWRIGHT_WAIT": os.getenv("PLAYWRIGHT_WAIT", "domcontentloaded"),
+    # default timeouts (ms)
+    "PAGE_TIMEOUT_MS": int(os.getenv("PAGE_TIMEOUT_MS", "20000")),
+    # offline by default; set ALLOW_NET=true to allow http(s)
+    "ALLOW_NET": os.getenv("ALLOW_NET", "false").lower(),
+    # optional allow-list when ALLOW_NET=true (comma-separated host names)
+    "ALLOW_HOSTS": os.getenv("ALLOW_HOSTS", ""),  # e.g. "fonts.googleapis.com,fonts.gstatic.com"
+    # if true, skip the PDF step (handy for debugging)
+    "ALLOW_PDF_SKIP": os.getenv("ALLOW_PDF_SKIP", "false").lower(),
+    # Optional AWS region for S3-style absolute URLs in <base>, if you want it
+    "AWS_REGION": os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1")),
+}
 
-SRC_FILE_NAME = os.getenv("SRC_FILE_NAME", "uptime-report.html")  # file to search for
-OUT_HTML_NAME = os.getenv("OUT_HTML_NAME", "uptime-report.html")  # copy name on dest
-OUT_PDF_NAME  = os.getenv("OUT_PDF_NAME",  "uptime-report.pdf")   # pdf name on dest
-
-PDF_FORMAT   = os.getenv("PDF_FORMAT", "A4")  # A4 | Letter | Legal | etc.
-WAIT_MODE    = os.getenv("PLAYWRIGHT_WAIT", "load").lower()  # load | domcontentloaded | networkidle
-ALLOW_PDF_SKIP = (os.getenv("ALLOW_PDF_SKIP", "false").lower() in ("1", "true", "yes"))
-PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "60000"))
-
-# ---------- clients ----------
 s3 = boto3.client("s3")
 
 
-# ---------- lambda entry ----------
-def lambda_handler(event, context):
-    """Main handler"""
-    try:
-        month_str, year_str = _resolve_month_year(event)
-    except ValueError as ve:
-        return _error(400, str(ve))
-
-    prefix = f"{BASE_PREFIX}/{year_str}/{month_str}/"
-    html_key      = f"{prefix}{SRC_FILE_NAME}"
-    dest_html_key = f"{prefix}{OUT_HTML_NAME}"
-    dest_pdf_key  = f"{prefix}{OUT_PDF_NAME}"
-
-    debug = _want_debug(event or {})
-
-    # Find newest uptime-report.html under prefix (either exact or any subfolder/*/uptime-report.html)
-    try:
-        latest_obj = _find_latest_report(SRC_BUCKET, prefix)
-        if latest_obj is None:
-            return _error(
-                404,
-                f'No "{SRC_FILE_NAME}" found under s3://{SRC_BUCKET}/{prefix} (including subfolders).'
-            )
-
-        src_key = latest_obj["Key"]
-        print(f"[src] using: s3://{SRC_BUCKET}/{src_key}")
-
-        obj = s3.get_object(Bucket=SRC_BUCKET, Key=src_key)
-        html = obj["Body"].read().decode("utf-8", errors="replace")
-
-    except ClientError as e:
-        msg = e.response.get("Error", {}).get("Message", str(e))
-        return _error(500, f"S3 error (read src): {msg}")
-
-    # Upload HTML copy to destination
-    try:
-        s3.put_object(
-            Bucket=DEST_BUCKET,
-            Key=dest_html_key,
-            Body=html.encode("utf-8"),
-            ContentType="text/html; charset=utf-8",
-            CacheControl="no-cache",
-        )
-        print(f"[html] uploaded -> s3://{DEST_BUCKET}/{dest_html_key}")
-    except ClientError as e:
-        msg = e.response.get("Error", {}).get("Message", str(e))
-        return _error(500, f"S3 error (write html): {msg}")
-
-    # Render PDF with Playwright / Chromium
-    pdf_ok = False
-    pdf_err = None
-    try:
-        _render_pdf_playwright(
-            html=html,
-            out_bucket=DEST_BUCKET,
-            out_key=dest_pdf_key,
-            pdf_format=PDF_FORMAT,
-            wait_mode=WAIT_MODE,
-            timeout_ms=PAGE_TIMEOUT_MS,
-        )
-        pdf_ok = True
-    except Exception as e:
-        pdf_err = str(e)
-        print(f"[error] PDF generation failed: {pdf_err}")
-
-    # Respond
-    if debug:
-        return _json({
-            "src_bucket": SRC_BUCKET,
-            "dest_bucket": DEST_BUCKET,
-            "prefix": prefix,
-            "html_key": src_key,
-            "dest_html_key": dest_html_key,
-            "dest_pdf_key": dest_pdf_key,
-            "pdf_ok": pdf_ok,
-            "pdf_error": pdf_err,
-        })
-
-    if not pdf_ok and not ALLOW_PDF_SKIP:
-        return _error(500, f"PDF generation failed: {pdf_err}")
-
-    # If not debug: return HTML body (useful to preview in API test)
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"},
-        "body": html,
-    }
-
-
-# ---------- helpers ----------
-def _want_debug(event: dict) -> bool:
-    """True if debug=1 passed via queryStringParameters or event JSON"""
-    try:
+# ----------------- Helpers -----------------
+def _debug_on(event: Any) -> bool:
+    """Return True if debug is requested (robust to non-strings)."""
+    qs = {}
+    if isinstance(event, dict):
         qs = event.get("queryStringParameters") or {}
-        raw = qs.get("debug", None)
-        if raw is None:
-            raw = event.get("debug", "")
-        dv = str(raw).strip().lower()
-        return dv in ("1", "true", "yes")
+    dv = qs.get("debug") or (event.get("debug") if isinstance(event, dict) else "")
+    try:
+        val = str(dv).strip().lower()
     except Exception:
-        return False
+        val = ""
+    return val in ("1", "true", "yes", "y", "on")
 
 
-def _resolve_month_year(event):
-    event = event or {}
-    qs = event.get("queryStringParameters") or {}
-
-    def _get(key):
-        v = qs.get(key)
-        if v is None and isinstance(event, dict):
-            v = event.get(key)
-        return str(v).strip() if v is not None else None
-
-    month = (_get("month") or "auto").lower()
-    year  = _get("year")
-
-    now = datetime.now(timezone.utc)
-    if month in ("auto", ""):
-        use_dt = now
-    elif month in ("prev", "previous", "last"):
-        first_of_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        use_dt = first_of_this - timedelta(days=1)
-    else:
-        if not month.isdigit() or not (1 <= int(month) <= 12):
-            raise ValueError('Invalid "month". Use two digits like "09", or "auto", or "prev".')
-        y = int(year) if year else now.year
-        use_dt = datetime(y, int(month), 1, tzinfo=timezone.utc)
-
-    if not year:
-        year = str(use_dt.year)
-
-    month_str = f"{use_dt.month:02d}" if month in ("auto", "prev", "previous", "last", "") else f"{int(month):02d}"
-    return month_str, year
+def _month_year_from_event(event: Dict[str, Any]) -> (str, str):
+    """Pull month/year from event with safe defaults (zero-padded month)."""
+    mo = str((event.get("month") if isinstance(event, dict) else "") or "").zfill(2) or "01"
+    yr = str((event.get("year") if isinstance(event, dict) else "") or "")
+    # fallbacks for console-tests without payload
+    if not yr:
+        yr = "2025"
+    if mo == "00":
+        mo = "01"
+    return mo, yr
 
 
-def _find_latest_report(bucket, prefix):
-    """Return latest object dict whose key is:
-       prefix + SRC_FILE_NAME  OR  prefix + */ + SRC_FILE_NAME
+def _s3_get_text(bucket: str, key: str) -> str:
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return obj["Body"].read().decode("utf-8", "replace")
+
+
+def _s3_put_bytes(bucket: str, key: str, data: bytes, content_type: str) -> None:
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+        CacheControl="no-cache",
+    )
+
+
+def _add_base_href(html: str, base_href: str) -> str:
     """
-    paginator = s3.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+    Ensure HTML contains a <base href="..."> so relative URLs resolve.
+    This helps when you choose to allow network access.
+    """
+    if not base_href:
+        return html
+    # If <head> exists, inject a <base> as the first child. Otherwise add a <head>.
+    if re.search(r"<head[^>]*>", html, flags=re.I):
+        return re.sub(
+            r"(?i)(<head[^>]*>)",
+            r'\1<base href="%s">' % re.escape(base_href),
+            html,
+            count=1,
+        )
+    else:
+        return re.sub(
+            r"(?i)(<html[^>]*>)",
+            r'\1<head><base href="%s"></head>' % re.escape(base_href),
+            html,
+            count=1,
+        )
 
-    latest = None
-    for page in pages:
-        contents = page.get("Contents", []) or []
-        if not contents:
+
+def _host_in(host: str, allowed: Iterable[str]) -> bool:
+    h = host.lower()
+    for pat in allowed:
+        pat = pat.strip().lower()
+        if not pat:
             continue
-        candidates = []
-        for obj in contents:
-            key = obj.get("Key", "")
-            if key == f"{prefix}{SRC_FILE_NAME}":
-                candidates.append(obj)
-            elif fnmatch.fnmatch(key, f"{prefix}*/{SRC_FILE_NAME}"):
-                candidates.append(obj)
-        if candidates:
-            candidates.sort(key=lambda o: o["LastModified"], reverse=True)
-            pick = candidates[0]
-            if (latest is None) or (pick["LastModified"] > latest["LastModified"]):
-                latest = pick
-    return latest
+        if h == pat or h.endswith("." + pat):
+            return True
+    return False
 
 
-def _render_pdf_playwright(html: str, out_bucket: str, out_key: str,
-                           pdf_format: str = "A4",
-                           wait_mode: str = "load",
-                           timeout_ms: int = 60000):
-    """Render the provided HTML string to PDF using Playwright/Chromium and upload to S3."""
+# --------------- Playwright PDF ---------------
+def _render_pdf_playwright(
+    html: str,
+    out_bucket: str,
+    out_key: str,
+    pdf_format: str = "A4",
+    wait_mode: str = "domcontentloaded",
+    timeout_ms: int = 20000,
+    allow_net: bool = False,
+    allow_hosts: Iterable[str] = (),
+) -> None:
+    """
+    Render HTML -> PDF with Playwright/Chromium.
+
+    Offline by default: blocks all http(s) unless allow_net=True.
+    If allow_net=True and allow_hosts is non-empty, only those hosts are allowed.
+    """
     from playwright.sync_api import sync_playwright
-
-    # Sanitize wait mode
-    wait_until = wait_mode if wait_mode in ("load", "domcontentloaded", "networkidle") else "load"
+    from urllib.parse import urlparse
 
     out_pdf = "/tmp/out.pdf"
 
     with sync_playwright() as p:
-        # Critical flags for Lambda (avoid GPU and /dev/shm issues)
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -222,14 +137,38 @@ def _render_pdf_playwright(html: str, out_bucket: str, out_key: str,
                 "--disable-software-rasterizer",
                 "--mute-audio",
                 "--single-process",
+                "--export-tagged-pdf",
             ],
         )
+        context = browser.new_context()
+        # Request routing: block external by default
+        def _route_handler(route):
+            req = route.request
+            url = req.url
+            if url.startswith("data:") or url.startswith("blob:"):
+                return route.continue_()
+            if url.startswith("file://"):
+                return route.continue_()
+            if url.startswith("http://") or url.startswith("https://"):
+                if not allow_net:
+                    return route.abort()
+                if allow_hosts:
+                    host = urlparse(url).hostname or ""
+                    if not _host_in(host, allow_hosts):
+                        return route.abort()
+                # allowed
+                return route.continue_()
+            return route.continue_()
+
+        context.route("**/*", _route_handler)
+
         try:
-            page = browser.new_page()
+            page = context.new_page()
             page.set_default_timeout(timeout_ms)
-            # Use screen media and allow CSS colors/backgrounds
+            page.set_default_navigation_timeout(timeout_ms)
             page.emulate_media(media="screen")
-            page.set_content(html, wait_until=wait_until)
+            page.set_content(html, wait_until=wait_mode)
+
             page.pdf(
                 path=out_pdf,
                 format=pdf_format,
@@ -239,32 +178,107 @@ def _render_pdf_playwright(html: str, out_bucket: str, out_key: str,
                 margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
             )
         finally:
+            context.close()
             browser.close()
 
-    # Upload
     with open(out_pdf, "rb") as f:
-        s3.put_object(
-            Bucket=out_bucket,
-            Key=out_key,
-            Body=f.read(),
-            ContentType="application/pdf",
-            CacheControl="no-cache",
+        _s3_put_bytes(out_bucket, out_key, f.read(), "application/pdf")
+
+
+# --------------- Lambda handler ---------------
+def lambda_handler(event, context):
+    dbg = _debug_on(event)
+    mo, yr = _month_year_from_event(event if isinstance(event, dict) else {})
+    prefix = f"{ENV['BASE_PREFIX'].rstrip('/')}/{yr}/{mo}/"
+
+    src_bucket = ENV["SRC_BUCKET"]
+    dest_bucket = ENV["DEST_BUCKET"]
+    html_key = f"{prefix}uptime-report.html"
+    pdf_key = f"{prefix}uptime-report.pdf"
+
+    if not src_bucket or not dest_bucket:
+        return _resp(
+            500,
+            {"error": "SRC_BUCKET and DEST_BUCKET must be set as environment variables."},
         )
-    print(f"[pdf] uploaded -> s3://{out_bucket}/{out_key}")
+
+    if dbg:
+        print(f"[versions] using playwright for PDF")
+        print(f"[cfg] SRC_BUCKET='{src_bucket}' DEST_BUCKET='{dest_bucket}' BASE_PREFIX='{ENV['BASE_PREFIX']}'")
+        print(f"[src] s3://{src_bucket}/{html_key}")
+
+    # Fetch HTML
+    try:
+        html = _s3_get_text(src_bucket, html_key)
+    except Exception as e:
+        return _resp(500, {"error": f"failed to read HTML from s3://{src_bucket}/{html_key}: {e}"})
+
+    # (Optional) put a copy of HTML to destination for auditing/viewing
+    try:
+        _s3_put_bytes(dest_bucket, html_key, html.encode("utf-8"), "text/html; charset=utf-8")
+        if dbg:
+            print(f"[html] uploaded -> s3://{dest_bucket}/{html_key}")
+    except Exception as e:
+        # non-fatal
+        print(f"[warn] failed to copy html to dest: {e}")
+
+    # Ensure relative URLs can resolve if you later allow network
+    base_url = f"https://{src_bucket}.s3.{ENV['AWS_REGION']}.amazonaws.com/{prefix}"
+    html_with_base = _add_base_href(html, base_url)
+
+    # Short-circuit for debug
+    if ENV["ALLOW_PDF_SKIP"] == "true":
+        return _resp(
+            200,
+            {
+                "src_bucket": src_bucket,
+                "dest_bucket": dest_bucket,
+                "prefix": prefix,
+                "html_key": html_key,
+                "dest_html_key": html_key,
+                "dest_pdf_key": pdf_key,
+                "skipped_pdf": True,
+            },
+        )
+
+    # Playwright render
+    try:
+        allow_net = (ENV["ALLOW_NET"] == "true")
+        allow_hosts = tuple([h.strip() for h in ENV["ALLOW_HOSTS"].split(",") if h.strip()])
+        _render_pdf_playwright(
+            html=html_with_base,
+            out_bucket=dest_bucket,
+            out_key=pdf_key,
+            pdf_format=ENV["PDF_FORMAT"],
+            wait_mode=ENV["PLAYWRIGHT_WAIT"],
+            timeout_ms=ENV["PAGE_TIMEOUT_MS"],
+            allow_net=allow_net,
+            allow_hosts=allow_hosts,
+        )
+        if dbg:
+            print(f"[pdf] uploaded -> s3://{dest_bucket}/{pdf_key}")
+        return _resp(
+            200,
+            {
+                "src_bucket": src_bucket,
+                "dest_bucket": dest_bucket,
+                "prefix": prefix,
+                "html_key": html_key,
+                "dest_html_key": html_key,
+                "dest_pdf_key": pdf_key,
+            },
+        )
+    except Exception as e:
+        print("[error] PDF generation failed")
+        import traceback
+
+        traceback.print_exc()
+        return _resp(500, {"error": f"PDF generation failed: {e}"})
 
 
-def _json(obj: dict):
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(obj),
-    }
-
-
-def _error(code: int, message: str):
-    print(f"[error] {message}")
+def _resp(code: int, body: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "statusCode": code,
         "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({"error": message}),
+        "body": json.dumps(body),
     }
