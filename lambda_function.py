@@ -1,95 +1,88 @@
 import os
 import json
 import tempfile
+from urllib.parse import quote
 import boto3
-from urllib.parse import urlencode
 from playwright.sync_api import sync_playwright
 
 S3 = boto3.client("s3")
 
-# Config via env (with defaults)
-SRC_BUCKET   = os.environ.get("SRC_BUCKET", "lambda-output-report-000000987123")
-DEST_BUCKET  = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
-BASE_PREFIX  = os.environ.get("BASE_PREFIX", "uptime")
-PDF_FORMAT   = os.environ.get("PDF_FORMAT", "A4")  # or "Letter"
+# Environment-driven config (set these on the Lambda)
+SRC_BUCKET  = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
+DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
+BASE_PREFIX = os.environ.get("BASE_PREFIX", "uptime")
+PDF_FORMAT  = os.environ.get("PDF_FORMAT",  "A4")  # or "Letter"
 
-def _key(year, month, name="uptime-report"):
-    return f"{BASE_PREFIX}/{year}/{month}/{name}.html"
+def _key(year: str, month: str, name="uptime-report", ext="html"):
+    return f"{BASE_PREFIX}/{year}/{month}/{name}.{ext}"
 
-def _resp(status, body):
-    return {
-        "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
-    }
-
-def _download_html(bucket, key, dst_path):
-    S3.download_file(bucket, key, dst_path)
-
-def _upload_bytes(bucket, key, data, content_type):
-    S3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+def _resp(code, body):
+    return {"statusCode": code,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(body)}
 
 def lambda_handler(event, context):
-    # Input: {"year":"2025","month":"09"}; debug optional
+    # Expect: {"year":"2025","month":"09"}
     year  = str((event or {}).get("year", "")).strip() or "2025"
     month = str((event or {}).get("month", "")).strip() or "09"
 
-    html_key = _key(year, month, "uptime-report")
+    html_key      = _key(year, month, "uptime-report", "html")
     dest_html_key = html_key
-    dest_pdf_key  = html_key.replace(".html", ".pdf")
+    dest_pdf_key  = _key(year, month, "uptime-report", "pdf")
 
-    # Prep temp files
-    os.makedirs("/tmp/fontcache", exist_ok=True)
+    # temp file for HTML
+    os.makedirs("/tmp", exist_ok=True)
     html_path = os.path.join(tempfile.gettempdir(), "report.html")
 
     try:
-        # Download HTML from source
-        _download_html(SRC_BUCKET, html_key, html_path)
+        # 1) Download source HTML
+        S3.download_file(SRC_BUCKET, html_key, html_path)
 
-        # Also copy HTML to dest bucket for reference (optional)
+        # 2) Optionally mirror the HTML to destination bucket
         with open(html_path, "rb") as f:
-            _upload_bytes(DEST_BUCKET, dest_html_key, f.read(), "text/html")
+            S3.put_object(Bucket=DEST_BUCKET, Key=dest_html_key, Body=f.read(), ContentType="text/html")
 
-        # Launch Chromium and print to PDF
+        # 3) Render to PDF using Chromium (Ctrl+P fidelity)
         with sync_playwright() as p:
-            # Headless Chromium with safe flags for Lambda
             browser = p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
-                    "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-dev-shm-usage",
                     "--disable-setuid-sandbox",
-                    "--font-render-hinting=none",
                     "--force-color-profile=srgb",
                 ],
             )
             context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
+                viewport={"width": 1366, "height": 768},
+                device_scale_factor=1.0,
                 color_scheme="light",
                 java_script_enabled=True,
-                device_scale_factor=1.0,
+                accept_downloads=False,
             )
             page = context.new_page()
 
-            # Load local file so relative assets inside HTML (if any) resolve
-            # If your HTML pulls remote assets (fonts/CSS), ensure Lambda has internet egress.
+            # Emulate print CSS like the browser print dialog
+            page.emulate_media(media="print")
+
+            # Load local file; relative assets in the HTML will resolve if they’re relative paths
             page.goto(f"file://{html_path}", wait_until="networkidle")
 
-            # Respect CSS @page size when present; else fallback to env format
-            pdf = page.pdf(
-                format=PDF_FORMAT,
+            # Native print-to-PDF (matches Chrome “Save as PDF”)
+            pdf_bytes = page.pdf(
                 print_background=True,
-                prefer_css_page_size=True,
-                margin={"top": "10mm", "right": "10mm", "bottom": "10mm", "left": "10mm"},
+                prefer_css_page_size=True,  # use @page size if present
+                format=PDF_FORMAT,          # fallback if @page not set
+                margin={"top": "0mm", "right": "0mm", "bottom": "0mm", "left": "0mm"},
                 landscape=False,
             )
 
             context.close()
             browser.close()
 
-        # Upload PDF
-        _upload_bytes(DEST_BUCKET, dest_pdf_key, pdf, "application/pdf")
+        # 4) Upload PDF
+        S3.put_object(Bucket=DEST_BUCKET, Key=dest_pdf_key, Body=pdf_bytes, ContentType="application/pdf")
 
         return _resp(200, {
             "src_bucket": SRC_BUCKET,
