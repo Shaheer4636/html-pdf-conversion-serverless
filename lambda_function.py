@@ -1,6 +1,6 @@
 # === EDIT THESE VALUES ===
 ART_BUCKET      = "canary-output-rainthos-009"
-ART_PREFIX      = "canary/us-east-1/clone2rainthos"   # folder *right above* the year
+ART_PREFIX      = "canary/us-east-1/clone2rainthos"   
 REPORTS_BUCKET  = "lambda-output-report-000000987123"
 REPORTS_PREFIX  = "uptime"
 
