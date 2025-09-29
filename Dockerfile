@@ -1,14 +1,22 @@
-FROM public.ecr.aws/lambda/python:3.11
-# System deps (fonts optional but recommended)
-RUN yum install -y \
-    xorg-x11-fonts-Type1 xorg-x11-fonts-misc \
+# AL2023 base (glibc 2.34)
+FROM public.ecr.aws/lambda/python:3.12
+
+# System libs + fonts required by Chromium
+RUN dnf install -y \
+    at-spi2-atk \
+    libXcomposite libXcursor libXdamage libXext libXi libXrandr libXrender libXScrnSaver libXtst \
+    pango gtk3 nss \
     dejavu-sans-fonts dejavu-serif-fonts dejavu-sans-mono-fonts \
-  && yum clean all
-# App deps
+ && dnf clean all
+
+# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Playwright browsers
-RUN playwright install --with-deps chromium
+
+# Download Chromium managed by Playwright (no --with-deps on AL2023)
+RUN python -m playwright install chromium
+
 # App
 COPY . .
+# Your handler is `index.handler` (change if needed)
 CMD ["index.handler"]
