@@ -1,21 +1,20 @@
-# Ubuntu 22.04 + Python + Playwright + browsers preinstalled
+# Playwright base with Python + Chromium + all deps preinstalled
 FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
-# Install Lambda Runtime Interface Client + boto3 for S3
+# AWS Lambda Python runtime shim
 RUN pip install --no-cache-dir awslambdaric boto3
 
-# Workdir for Lambda code
+# Workdir for Lambda
 WORKDIR /var/task
 
-# Copy your Lambda handler
+# Your Lambda handler
 COPY lambda_function.py /var/task/lambda_function.py
 
-# Make font caches writable at runtime
+# Ensure caches are writable inside Lambda
 ENV HOME=/tmp \
     XDG_CACHE_HOME=/tmp \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    FONTCONFIG_PATH=/etc/fonts \
-    FONTCONFIG_FILE=/etc/fonts/fonts.conf
+    FONTCONFIG_PATH=/etc/fonts
 
-# Launch Lambda runtime against our handler
+# Start the Lambda runtime
 CMD ["python", "-m", "awslambdaric", "lambda_function.lambda_handler"]
