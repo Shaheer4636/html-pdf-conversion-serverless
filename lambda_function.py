@@ -8,7 +8,7 @@ COMPANY         = "Situs-AMC"
 SERVICE         = "Useful App"
 CLIENT          = "CitiBank"
 
-ONLY_BROWSER    = "ANY"       # e.g. "CHROME" if you have a browser subfolder, else "ANY"
+ONLY_BROWSER    = "ANY"       # e.g. "CHRO
 FAIL_STREAK     = 3           # minutes in a row that constitute an incident
 TREAT_MISSING   = False       # True: missing minutes count as failures
 
