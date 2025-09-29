@@ -7,3 +7,4 @@ fonttools==4.53.0
 Pillow==10.3.0
 Pyphen==0.14.0
 cffi==1.16.0
+playwright==1.46.0
