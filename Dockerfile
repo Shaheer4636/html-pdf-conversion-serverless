@@ -1,20 +1,38 @@
-# Playwright base with Python + Chromium + all deps preinstalled
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+# Lambda base (Amazon Linux 2023, Python 3.12)
+FROM public.ecr.aws/lambda/python:3.12
 
-# AWS Lambda Python runtime shim
-RUN pip install --no-cache-dir awslambdaric boto3
+# Keep browser in a fixed, read-only path
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp
 
-# Workdir for Lambda
-WORKDIR /var/task
+# --- System libraries Chromium needs on AL2023 ---
+RUN dnf install -y \
+    at-spi2-atk at-spi2-core atk \
+    alsa-lib \
+    cairo pango gdk-pixbuf2 \
+    cups-libs dbus-libs expat glib2 \
+    libX11 libXcomposite libXcursor libXdamage libXext \
+    libXi libXrandr libXrender libXScrnSaver libXtst \
+    libdrm mesa-libgbm \
+    nss nspr \
+    freetype fontconfig \
+    libjpeg-turbo libpng zlib \
+  && dnf clean all
 
-# Your Lambda handler
-COPY lambda_function.py /var/task/lambda_function.py
+# Optional: a place for custom fonts (won’t fail if empty)
+RUN mkdir -p /usr/share/fonts/custom
 
-# Ensure caches are writable inside Lambda
-ENV HOME=/tmp \
-    XDG_CACHE_HOME=/tmp \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    FONTCONFIG_PATH=/etc/fonts
+# Python deps
+COPY requirements.txt /var/task/requirements.txt
+RUN pip install --no-cache-dir -r /var/task/requirements.txt
 
-# Start the Lambda runtime
-CMD ["python", "-m", "awslambdaric", "lambda_function.lambda_handler"]
+# Download Chromium once at build-time (no apt, just the browser files)
+RUN python -m playwright install chromium
+
+# App code
+COPY lambda_function.py ${LAMBDA_TASK_ROOT}/
+
+# Lambda entrypoint
+CMD ["lambda_function.lambda_handler"]
