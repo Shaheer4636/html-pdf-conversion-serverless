@@ -7,10 +7,10 @@ SRC_BUCKET  = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
 DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX = os.environ.get("BASE_PREFIX", "uptime")
 PDF_FORMAT  = os.environ.get("PDF_FORMAT", "A4")  # or "Letter"
-WAIT_UNTIL  = os.environ.get("PLAYWRIGHT_WAIT", "networkidle")  # 'load' | 'domcontentloaded' | 'networkidle'
+WAIT_UNTIL  = os.environ.get("PLAYWRIGHT_WAIT", "networkidle")
 ALLOW_NET   = os.environ.get("ALLOW_NET", "true").lower() == "true"
 
-# Pin browser location (matches your Dockerfile)
+# Pin browser location (we set this in the Dockerfile)
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/ms-playwright")
 
 s3 = boto3.client("s3")
@@ -20,7 +20,6 @@ def _keys(evt):
     y = str(evt.get("year")  or "")
     m = str(evt.get("month") or "")
     if not y or not m:
-        # default to current UTC
         import datetime as dt
         now = dt.datetime.utcnow()
         y = y or str(now.year)
@@ -43,30 +42,11 @@ def _download_html(bucket, key) -> str:
 
 
 def _absolutize_html(html: str, base_href: str) -> str:
-    """
-    Fallback for when we can't or don't want to use a URL:
-      - inject <base href="..."> into <head>
-      - rewrite root-relative src/href starting with '/' to absolute under base
-    """
-    # inject <base> right after <head>
+    # Inject <base href> so relative src/href resolve
     if "<head" in html.lower():
         html = re.sub(r"(?i)(<head[^>]*>)", r'\1<base href="%s"/>' % base_href, html, count=1)
     else:
         html = '<head><base href="%s"/></head>' % base_href + html
-
-    def repl(m):
-        quote, path = m.group(1), m.group(2)
-        if path.startswith("http://") or path.startswith("https://") or path.startswith("data:") or path.startswith("blob:"):
-            return m.group(0)
-        if path.startswith("/"):
-            absu = urljoin(base_href, path.lstrip("/"))
-        else:
-            absu = urljoin(base_href, path)
-        return f'{quote}{absu}"'
-
-    # src="..." and href="..."
-    html = re.sub(r'(?i)(src|href)\s*=\s*"(.*?)"', lambda m: m.group(0) if m.group(2).startswith(("http","data:","blob:")) else repl(('"', m.group(2))), html)
-    html = re.sub(r"(?i)(src|href)\s*=\s*'(.*?)'", lambda m: m.group(0) if m.group(2).startswith(("http","data:","blob:")) else m.group(0).replace(m.group(2), urljoin(base_href, m.group(2).lstrip("/"))), html)
     return html
 
 
@@ -90,22 +70,20 @@ def _render_pdf_from_url(url: str) -> bytes:
                 ctx.route("**/*", lambda r: r.abort() if r.request.url.startswith(("http://","https://")) else r.continue_())
             page = ctx.new_page()
             page.set_default_navigation_timeout(45000)
-            page.emulate_media(media="print")  # match Ctrl+P
+            page.emulate_media(media="print")
             page.goto(url, wait_until=WAIT_UNTIL)
-            pdf = page.pdf(
+            return page.pdf(
                 format=PDF_FORMAT,
                 print_background=True,
                 prefer_css_page_size=True,
                 margin={"top":"0","right":"0","bottom":"0","left":"0"},
                 scale=1.0,
             )
-            return pdf
         finally:
             browser.close()
 
 
-def _render_pdf_from_html(html: str, base_href_for_assets: str) -> bytes:
-    # Inline mode with base href rewrite (safety net)
+def _render_pdf_from_html(html: str, base_href: str) -> bytes:
     args = [
         "--headless=new",
         "--no-sandbox", "--disable-setuid-sandbox",
@@ -119,16 +97,15 @@ def _render_pdf_from_html(html: str, base_href_for_assets: str) -> bytes:
             page = ctx.new_page()
             page.set_default_navigation_timeout(45000)
             page.emulate_media(media="print")
-            html2 = _absolutize_html(html, base_href_for_assets.rstrip("/") + "/")
-            page.set_content(html2, wait_until=WAIT_UNTIL)
-            pdf = page.pdf(
+            page.set_content(_absolutize_html(html, base_href.rstrip('/') + '/'),
+                             wait_until=WAIT_UNTIL)
+            return page.pdf(
                 format=PDF_FORMAT,
                 print_background=True,
                 prefer_css_page_size=True,
                 margin={"top":"0","right":"0","bottom":"0","left":"0"},
                 scale=1.0,
             )
-            return pdf
         finally:
             browser.close()
 
@@ -136,14 +113,11 @@ def _render_pdf_from_html(html: str, base_href_for_assets: str) -> bytes:
 def lambda_handler(event, _ctx=None):
     try:
         prefix, html_key, pdf_key = _keys(event or {})
-        # 1) Preferred path: load the actual HTML via pre-signed URL (so all relative links work)
         url = _presigned_url(SRC_BUCKET, html_key, seconds=600)
-        pdf = _render_pdf_from_url(url)
+        pdf = _render_pdf_from_url(url)  # preferred: identical to Ctrl+P
     except Exception as primary_error:
-        # 2) Fallback: pull the HTML and rewrite with <base href=...>
         try:
             html = _download_html(SRC_BUCKET, html_key)
-            # Public-style URL for root resolution; adjust if you use a CF distro
             base_href = f"https://{SRC_BUCKET}.s3.amazonaws.com/{prefix}"
             pdf = _render_pdf_from_html(html, base_href)
         except Exception as secondary_error:
