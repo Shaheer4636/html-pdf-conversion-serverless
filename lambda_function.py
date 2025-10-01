@@ -8,7 +8,7 @@ BASE_PREFIX     = os.environ.get("BASE_PREFIX", "uptime")
 PDF_FORMAT      = os.environ.get("PDF_FORMAT",  "A4")
 JS_DELAY_MS     = int(os.environ.get("JS_DELAY_MS", "6000"))
 ALLOW_PDF_SKIP  = os.environ.get("ALLOW_PDF_SKIP", "false")
-# --------------------------
+# ------------------
 
 os.environ.setdefault("HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
