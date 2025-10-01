@@ -1,30 +1,56 @@
+# Lambda base (Amazon Linux 2023)
 FROM public.ecr.aws/lambda/python:3.12
 
-# Render/runtime deps (no update; no curl replacement to avoid curl-minimal conflicts)
+# Render deps (fonts, cairo, X libs). Keep it simple; no exotic flags.
 RUN dnf -y install \
       fontconfig freetype cairo harfbuzz \
       dejavu-sans-fonts dejavu-serif-fonts \
       liberation-sans-fonts liberation-serif-fonts \
       libX11 libXext libXrender libXau libXdmcp \
-      tar xz ca-certificates \
-      --setopt=install_weak_deps=0 \
- && dnf clean all
+      libjpeg-turbo libpng tar xz ca-certificates \
+  && dnf clean all
 
-# ---- wkhtmltopdf (COPY a tested tar.xz into the image) ----
-# Put a working archive in your repo at tools/wkhtmltox.tar.xz
-# (from the official wkhtmltopdf "packaging" releases; generic linux amd64 build)
-COPY tools/wkhtmltox.tar.xz /tmp/wkhtmltox.tar.xz
+# Download a generic wkhtmltopdf build at build-time (no repo file needed)
+# We use Python's stdlib to avoid curl-minimal conflicts.
 RUN set -eux; \
-    xz -t /tmp/wkhtmltox.tar.xz; \
-    mkdir -p /opt/wkhtmltox; \
-    tar -xJf /tmp/wkhtmltox.tar.xz -C /opt/wkhtmltox --strip-components=1; \
-    ln -sf /opt/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/wkhtmltopdf; \
-    /opt/wkhtmltox/bin/wkhtmltopdf --version
+  python - <<'PY' \
+import sys,urllib.request,os,subprocess,tarfile
+urls=[
+ "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.linux-generic-amd64.tar.xz",
+ "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1/wkhtmltox-0.12.6.1-linux-generic-amd64.tar.xz",
+]
+dest="/tmp/wkhtmltox.tar.xz"
+for u in urls:
+    try:
+        with urllib.request.urlopen(u) as r:
+            data=r.read()
+            if len(data) < 10_000_000:  # sanity: ~50MB expected
+                continue
+            open(dest,"wb").write(data)
+            break
+    except Exception as e:
+        pass
+if not os.path.exists(dest):
+    print("FAILED to download wkhtmltopdf tarball", file=sys.stderr); sys.exit(1)
+os.makedirs("/opt/wkhtmltox", exist_ok=True)
+# extract .tar.xz
+subprocess.check_call(["tar","-xJf",dest,"-C","/opt/wkhtmltox","--strip-components=1"])
+PY
+# symlink so pdfkit can find it
+RUN ln -sf /opt/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/wkhtmltopdf \
+ && /usr/local/bin/wkhtmltopdf --version
 
+# Python deps
 WORKDIR /var/task
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --target .
+
+# Your Lambda handler
 COPY lambda_function.py .
 
-ENV HOME=/tmp XDG_CACHE_HOME=/tmp FONTCONFIG_PATH=/etc/fonts
-CMD [ "lambda_function.lambda_handler" ]
+# env to keep font cache writable in Lambda
+ENV HOME=/tmp \
+    XDG_CACHE_HOME=/tmp \
+    FONTCONFIG_PATH=/etc/fonts
+
+CMD [ "lambda_function.handler" ]
