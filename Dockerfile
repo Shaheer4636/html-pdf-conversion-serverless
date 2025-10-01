@@ -1,7 +1,7 @@
 # Lambda base (Amazon Linux 2023)
 FROM public.ecr.aws/lambda/python:3.12
 
-# Fonts + render libs (no curl needed)
+# Fonts + render libs
 RUN dnf -y install \
       fontconfig freetype cairo harfbuzz \
       dejavu-sans-fonts dejavu-serif-fonts \
@@ -10,11 +10,9 @@ RUN dnf -y install \
       xz tar libjpeg-turbo \
     && dnf clean all
 
-# Install wkhtmltopdf by DOWNLOADING the RPM, then local-install it.
-# We try 0.12.6-1 first, then 0.12.5-1 as a fallback.
-RUN set -eux; \
-  python - <<'PY' \
-import os, sys, urllib.request, shutil, ssl, tempfile, pathlib, subprocess, stat
+# 1) Download wkhtmltopdf RPM (Python stdlib; robust to curl-minimal conflicts)
+RUN python - <<'PY'
+import os, ssl, urllib.request, shutil, sys
 urls = [
   "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.centos8.x86_64.rpm",
   "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.5-1/wkhtmltox-0.12.5-1.centos8.x86_64.rpm",
@@ -34,14 +32,17 @@ for u in urls:
         continue
 if not (os.path.exists(dest) and os.path.getsize(dest) > 10_000_000):
     print("FATAL: could not download wkhtmltopdf RPM", file=sys.stderr); sys.exit(1)
-PY \
-  && dnf -y install /tmp/wkhtmltox.rpm \
-  && /usr/local/bin/wkhtmltopdf --version
+PY
 
+# 2) Install the RPM locally and verify
+RUN dnf -y install /tmp/wkhtmltox.rpm && /usr/local/bin/wkhtmltopdf --version
+
+# App deps
 WORKDIR /var/task
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --target .
 
+# App code
 COPY lambda_function.py .
 
 # tmp dirs for wkhtmltopdf / fontconfig caches
