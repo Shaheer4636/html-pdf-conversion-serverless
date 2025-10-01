@@ -1,16 +1,17 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# Render deps + tools
-RUN dnf -y update && dnf -y install \
-    fontconfig freetype cairo harfbuzz \
-    dejavu-sans-fonts dejavu-serif-fonts \
-    liberation-sans-fonts liberation-serif-fonts \
-    libX11 libXext libXrender libXau libXdmcp \
-    tar xz curl ca-certificates \
+# Render deps (no full update) and avoid curl-minimal conflicts
+RUN dnf -y install \
+      fontconfig freetype cairo harfbuzz \
+      dejavu-sans-fonts dejavu-serif-fonts \
+      liberation-sans-fonts liberation-serif-fonts \
+      libX11 libXext libXrender libXau libXdmcp \
+      tar xz ca-certificates curl \
+      --setopt=install_weak_deps=False \
+      --allowerasing --exclude=curl-minimal \
  && dnf clean all
 
-# --- Fetch a real wkhtmltox asset from the GitHub API (no hard-coded filename) ---
-# We keep the entire bundle under /opt/wkhtmltox and symlink the binary.
+# --- Fetch wkhtmltox asset dynamically (no hard-coded filename) ---
 ARG WKHTML_TAG=0.12.6-1
 RUN set -eux; \
     api="https://api.github.com/repos/wkhtmltopdf/packaging/releases/tags/${WKHTML_TAG}"; \
@@ -28,12 +29,10 @@ RUN set -eux; \
     ln -sf /opt/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/wkhtmltopdf; \
     /opt/wkhtmltox/bin/wkhtmltopdf --version
 
-# Python deps
 WORKDIR /var/task
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --target .
 
-# App
 COPY lambda_function.py .
 
 ENV HOME=/tmp XDG_CACHE_HOME=/tmp FONTCONFIG_PATH=/etc/fonts
