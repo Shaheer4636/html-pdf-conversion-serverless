@@ -1,6 +1,6 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# Fonts + X libs + tools needed to unpack the wkhtmltopdf archive
+# Fonts + X libs + tools
 RUN dnf -y update && dnf -y install \
     fontconfig freetype \
     dejavu-sans-fonts dejavu-serif-fonts \
@@ -9,14 +9,29 @@ RUN dnf -y update && dnf -y install \
     tar xz \
  && dnf clean all
 
-# Download a static wkhtmltopdf 0.12.6-1 build and install it
-RUN curl -L -o /tmp/wkhtmltox.tar.xz \
+# --- Robust wkhtmltopdf install (static linux-generic build) ---
+RUN set -eux; \
+    urls="\
       https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.linux-generic-amd64.tar.xz \
- && mkdir -p /opt/wkhtmltox \
- && tar -xJf /tmp/wkhtmltox.tar.xz -C /opt/wkhtmltox --strip-components=1 \
- && cp /opt/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/wkhtmltopdf \
- && chmod +x /usr/local/bin/wkhtmltopdf \
- && /usr/local/bin/wkhtmltopdf --version
+      https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1/wkhtmltox-0.12.6.1-linux-generic-amd64.tar.xz \
+      https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.linux-generic-x86_64.tar.xz \
+    "; \
+    for u in $urls; do \
+      echo "Trying $u"; \
+      if curl -fSLS "$u" -o /tmp/wkhtmltox.tar.xz; then \
+        if xz -t /tmp/wkhtmltox.tar.xz; then \
+          echo "Downloaded valid .xz"; \
+          break; \
+        fi; \
+      fi; \
+      rm -f /tmp/wkhtmltox.tar.xz || true; \
+    done; \
+    test -s /tmp/wkhtmltox.tar.xz; \
+    mkdir -p /opt/wkhtmltox; \
+    tar -xJf /tmp/wkhtmltox.tar.xz -C /opt/wkhtmltox --strip-components=1; \
+    install -m 0755 /opt/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/wkhtmltopdf; \
+    /usr/local/bin/wkhtmltopdf --version
+# --- end wkhtmltopdf install ---
 
 WORKDIR /var/task
 COPY requirements.txt .
