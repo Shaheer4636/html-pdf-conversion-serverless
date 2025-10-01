@@ -1,2 +1,2 @@
-boto3
-playwright==1.46.*
+boto3==1.35.10
+pdfkit==1.0.0
