@@ -1,6 +1,6 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# Render deps (no full OS update) and avoid curl-minimal conflicts
+# Render/runtime deps (no update; no curl replacement to avoid curl-minimal conflicts)
 RUN dnf -y install \
       fontconfig freetype cairo harfbuzz \
       dejavu-sans-fonts dejavu-serif-fonts \
@@ -8,21 +8,13 @@ RUN dnf -y install \
       libX11 libXext libXrender libXau libXdmcp \
       tar xz ca-certificates \
       --setopt=install_weak_deps=0 \
-      --exclude=curl-minimal \
  && dnf clean all
 
-# Download a valid wkhtmltox asset dynamically and install (keep lib/ next to bin/)
-ARG WKHTML_TAG=0.12.6-1
+# ---- wkhtmltopdf (COPY a tested tar.xz into the image) ----
+# Put a working archive in your repo at tools/wkhtmltox.tar.xz
+# (from the official wkhtmltopdf "packaging" releases; generic linux amd64 build)
+COPY tools/wkhtmltox.tar.xz /tmp/wkhtmltox.tar.xz
 RUN set -eux; \
-    api="https://api.github.com/repos/wkhtmltopdf/packaging/releases/tags/${WKHTML_TAG}"; \
-    asset="$(curl -fsSL "$api" \
-      | tr -d '\r' \
-      | grep -Eo '"browser_download_url":\s*"[^"]+' \
-      | cut -d'"' -f4 \
-      | grep -E 'linux.*(amd64|x86_64).*\.tar\.xz$' \
-      | head -n1)"; \
-    test -n "$asset"; echo "Downloading: $asset"; \
-    curl -fsSL "$asset" -o /tmp/wkhtmltox.tar.xz; \
     xz -t /tmp/wkhtmltox.tar.xz; \
     mkdir -p /opt/wkhtmltox; \
     tar -xJf /tmp/wkhtmltox.tar.xz -C /opt/wkhtmltox --strip-components=1; \
@@ -32,7 +24,6 @@ RUN set -eux; \
 WORKDIR /var/task
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --target .
-
 COPY lambda_function.py .
 
 ENV HOME=/tmp XDG_CACHE_HOME=/tmp FONTCONFIG_PATH=/etc/fonts
