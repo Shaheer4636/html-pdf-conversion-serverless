@@ -1,33 +1,24 @@
-import os
-import json
-import boto3
-import pdfkit
+import os, json, boto3, pdfkit
 from datetime import datetime
 from botocore.exceptions import ClientError
 from urllib.request import urlopen
 
-# ---------- ENV ----------
 SRC_BUCKET  = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
 DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX = os.environ.get("BASE_PREFIX", "uptime")
 PDF_FORMAT  = os.environ.get("PDF_FORMAT",  "A4")
 JS_DELAY_MS = int(os.environ.get("JS_DELAY_MS", "3000"))
 
-# wkhtmltopdf path provided by the RPM we install in Dockerfile
 WKHTMLTOPDF_BIN = "/usr/local/bin/wkhtmltopdf"
-
 s3 = boto3.client("s3")
 
-def _yyyymm_from_event(event: dict):
+def _yyyymm(event: dict):
     now = datetime.utcnow()
-    y = str(event.get("year") or now.year).zfill(4)
-    m = str(event.get("month") or now.month).zfill(2)
-    return y, m
+    return str(event.get("year") or now.year).zfill(4), str(event.get("month") or now.month).zfill(2)
 
-def _build_key(year, month, name):
-    return f"{BASE_PREFIX}/{year}/{month}/{name}"
+def _key(y, m, name): return f"{BASE_PREFIX}/{y}/{m}/{name}"
 
-def _pdf_options():
+def _options():
     return {
         "page-size": PDF_FORMAT,
         "print-media-type": None,
@@ -38,55 +29,45 @@ def _pdf_options():
         "margin-bottom": "0mm",
         "margin-left": "0mm",
         "javascript-delay": str(JS_DELAY_MS),
-        # "window-status": "done",  # if your page sets window.status='done'
+        # "window-status": "done",
     }
 
-def _load_html_from_s3(bucket: str, key: str) -> str:
+def _html_from_s3(bucket, key):
     obj = s3.get_object(Bucket=bucket, Key=key)
     return obj["Body"].read().decode("utf-8", errors="ignore")
 
-def _load_html_from_url(url: str) -> str:
-    with urlopen(url) as r:
-        return r.read().decode("utf-8", errors="ignore")
-
 def lambda_handler(event, context):
     try:
-        global JS_DELAY_MS
         if "js_delay_ms" in event:
-            JS_DELAY_MS = int(event["js_delay_ms"])
+            globals()["JS_DELAY_MS"] = int(event["js_delay_ms"])
 
-        # Determine source HTML
         if "html" in event:
             html = event["html"]
         elif "html_url" in event:
-            html = _load_html_from_url(event["html_url"])
+            with urlopen(event["html_url"]) as r:
+                html = r.read().decode("utf-8", errors="ignore")
         else:
             if "html_key" in event:
                 html_key = event["html_key"]
                 src_bucket = event.get("src_bucket", SRC_BUCKET)
             else:
-                year, month = _yyyymm_from_event(event or {})
-                html_key = _build_key(year, month, "uptime-report.html")
+                y, m = _yyyymm(event or {})
+                html_key = _key(y, m, "uptime-report.html")
                 src_bucket = SRC_BUCKET
-            html = _load_html_from_s3(src_bucket, html_key)
+            html = _html_from_s3(src_bucket, html_key)
 
         if not html:
-            return {"statusCode": 400, "body": json.dumps({"error": "No HTML provided/resolved"})}
+            return {"statusCode": 400, "body": json.dumps({"error":"No HTML provided/resolved"})}
 
-        # Destination
         if "dest_key" in event:
             pdf_key = event["dest_key"]
         else:
-            year, month = _yyyymm_from_event(event or {})
-            pdf_key = _build_key(year, month, "uptime-report.pdf")
+            y, m = _yyyymm(event or {})
+            pdf_key = _key(y, m, "uptime-report.pdf")
 
-        # Ensure binary exists
         config = pdfkit.configuration(wkhtmltopdf=WKHTMLTOPDF_BIN)
+        pdf_bytes = pdfkit.from_string(html, False, options=_options(), configuration=config)
 
-        # Render
-        pdf_bytes = pdfkit.from_string(html, False, options=_pdf_options(), configuration=config)
-
-        # Save to S3
         s3.put_object(
             Bucket=event.get("dest_bucket", DEST_BUCKET),
             Key=pdf_key,
@@ -96,18 +77,15 @@ def lambda_handler(event, context):
 
         return {
             "statusCode": 200,
-            "headers": {"Content-Type": "application/json"},
+            "headers": {"Content-Type":"application/json"},
             "body": json.dumps({
-                "src_bucket": SRC_BUCKET,
-                "dest_bucket": DEST_BUCKET,
+                "dest_bucket": event.get("dest_bucket", DEST_BUCKET),
                 "pdf_key": pdf_key,
                 "pdf_size": len(pdf_bytes),
-                "wkhtmltopdf": WKHTMLTOPDF_BIN,
-                "js_delay_ms": JS_DELAY_MS
-            }),
+            })
         }
 
     except ClientError as e:
-        return {"statusCode": 404, "body": json.dumps({"error": "S3 access failed", "detail": str(e)})}
+        return {"statusCode": 404, "body": json.dumps({"error":"S3 access failed","detail":str(e)})}
     except Exception as e:
-        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
+        return {"statusCode": 500, "body": json.dumps({"error":str(e)})}
