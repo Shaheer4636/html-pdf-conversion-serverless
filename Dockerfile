@@ -1,17 +1,17 @@
 FROM public.ecr.aws/lambda/python:3.12
 
-# Render deps (no full update) and avoid curl-minimal conflicts
+# Render deps (no full OS update) and avoid curl-minimal swaps
 RUN dnf -y install \
       fontconfig freetype cairo harfbuzz \
       dejavu-sans-fonts dejavu-serif-fonts \
       liberation-sans-fonts liberation-serif-fonts \
       libX11 libXext libXrender libXau libXdmcp \
-      tar xz ca-certificates curl \
-      --setopt=install_weak_deps=False \
+      tar xz ca-certificates \
+      --setopt=install_weak_deps=0 \
       --allowerasing --exclude=curl-minimal \
  && dnf clean all
 
-# --- Fetch wkhtmltox asset dynamically (no hard-coded filename) ---
+# --- Fetch a valid wkhtmltox asset dynamically (prevents 404s) ---
 ARG WKHTML_TAG=0.12.6-1
 RUN set -eux; \
     api="https://api.github.com/repos/wkhtmltopdf/packaging/releases/tags/${WKHTML_TAG}"; \
@@ -26,6 +26,7 @@ RUN set -eux; \
     xz -t /tmp/wkhtmltox.tar.xz; \
     mkdir -p /opt/wkhtmltox; \
     tar -xJf /tmp/wkhtmltox.tar.xz -C /opt/wkhtmltox --strip-components=1; \
+    # keep lib/ next to bin/, symlink the binary:
     ln -sf /opt/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/wkhtmltopdf; \
     /opt/wkhtmltox/bin/wkhtmltopdf --version
 
