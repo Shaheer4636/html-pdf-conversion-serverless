@@ -2,7 +2,6 @@ import os, json, boto3, pdfkit
 from datetime import datetime
 from botocore.exceptions import ClientError
 
-# --- ENV (kept your names) ---
 SRC_BUCKET   = os.environ.get("SRC_BUCKET", "")
 DEST_BUCKET  = os.environ.get("DEST_BUCKET", "")
 BASE_PREFIX  = os.environ.get("BASE_PREFIX", "uptime")
