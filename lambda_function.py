@@ -1,91 +1,105 @@
-import json, os, tempfile, boto3
+import os
+import json
 from datetime import datetime
-from playwright.sync_api import sync_playwright
 
-# -------- keep your env vars --------
+import boto3
+import pdfkit
+from botocore.exceptions import ClientError
+
+# --------- SAME ENV VARS YOU ALREADY USE ----------
 SRC_BUCKET  = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
 DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX = os.environ.get("BASE_PREFIX", "uptime")
 PDF_FORMAT  = os.environ.get("PDF_FORMAT",  "A4")
-PW_WAIT     = os.environ.get("PLAYWRIGHT_WAIT", "networkidle")
+# Give JS time to render charts/canvas; tweak if needed.
+JS_DELAY_MS = int(os.environ.get("JS_DELAY_MS", "6000"))
 
-# ensure writable caches for fonts/playwright
+# Lambda scratch/caches
 os.environ.setdefault("HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
 
 s3 = boto3.client("s3")
 
-def _yyyymm(event):
-    year  = str(event.get("year")  or datetime.utcnow().year).zfill(4)
-    month = str(event.get("month") or datetime.utcnow().month).zfill(2)
+
+def _yyyymm(event: dict):
+    now = datetime.utcnow()
+    year = str(event.get("year") or now.year).zfill(4)
+    month = str(event.get("month") or now.month).zfill(2)
     return year, month
 
-def _key(year, month, name): return f"{BASE_PREFIX}/{year}/{month}/{name}"
+
+def _key(year: str, month: str, name: str) -> str:
+    return f"{BASE_PREFIX}/{year}/{month}/{name}"
+
 
 def lambda_handler(event, context=None):
     year, month = _yyyymm(event or {})
     html_key = _key(year, month, "uptime-report.html")
     pdf_key  = _key(year, month, "uptime-report.pdf")
 
-    # fetch HTML from src bucket
-    obj = s3.get_object(Bucket=SRC_BUCKET, Key=html_key)
+    # 1) Read HTML from source bucket
+    try:
+        obj = s3.get_object(Bucket=SRC_BUCKET, Key=html_key)
+    except ClientError as e:
+        return {
+            "statusCode": 404,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": f"Missing {SRC_BUCKET}/{html_key}", "detail": str(e)})
+        }
+
     html = obj["Body"].read().decode("utf-8", errors="ignore")
 
-    # copy HTML to dest for inspection
+    # 2) Copy HTML into dest bucket for inspection/debug (same key)
     s3.copy_object(
         CopySource={"Bucket": SRC_BUCKET, "Key": html_key},
-        Bucket=DEST_BUCKET, Key=html_key,
+        Bucket=DEST_BUCKET,
+        Key=html_key,
         MetadataDirective="REPLACE",
         ContentType="text/html; charset=utf-8"
     )
 
-    with sync_playwright() as p:
-        # IMPORTANT: headless=False + "--headless=old" (only one headless mode)
-        browser = p.chromium.launch(
-            headless=False,
-            args=[
-                "--headless=old",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--no-zygote",
-                "--single-process",
-                "--force-color-profile=srgb",
-                "--export-tagged-pdf",
-            ],
-        )
-        try:
-            page = browser.new_page()
-            page.emulate_media(media="print")
-            page.set_content(html, wait_until=PW_WAIT)
+    # 3) HTML -> PDF using wkhtmltopdf binary baked into the image
+    config = pdfkit.configuration(wkhtmltopdf="/usr/local/bin/wkhtmltopdf")
+    options = {
+        "page-size": PDF_FORMAT,
+        "print-media-type": None,            # use @media print
+        "enable-local-file-access": None,    # allow relative assets
+        "encoding": "UTF-8",
+        "margin-top": "0mm",
+        "margin-right": "0mm",
+        "margin-bottom": "0mm",
+        "margin-left": "0mm",
+        "javascript-delay": str(JS_DELAY_MS),
+        "quiet": None,
+        # If your HTML sets window.status='done' after charts finish:
+        # "window-status": "done",
+        # and you can remove "javascript-delay".
+        # For stubborn scripts:
+        # "no-stop-slow-scripts": None,
+        # "load-error-handling": "ignore",
+    }
 
-            pdf_bytes = page.pdf(
-                format=PDF_FORMAT,
-                print_background=True,
-                prefer_css_page_size=True,
-                margin={"top":"0","right":"0","bottom":"0","left":"0"},
-                scale=1.0,
-            )
-        finally:
-            browser.close()
+    pdf_bytes = pdfkit.from_string(html, False, options=options, configuration=config)
 
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes); tmp.flush()
-        s3.upload_file(tmp.name, DEST_BUCKET, pdf_key,
-                       ExtraArgs={"ContentType":"application/pdf"})
+    # 4) Upload PDF
+    s3.put_object(
+        Bucket=DEST_BUCKET,
+        Key=pdf_key,
+        Body=pdf_bytes,
+        ContentType="application/pdf",
+    )
 
     return {
         "statusCode": 200,
-        "headers": {"Content-Type":"application/json"},
+        "headers": {"Content-Type": "application/json"},
         "body": json.dumps({
             "src_bucket": SRC_BUCKET,
             "dest_bucket": DEST_BUCKET,
             "prefix": f"{BASE_PREFIX}/{year}/{month}/",
             "html_key": html_key,
             "dest_html_key": html_key,
-            "dest_pdf_key": pdf_key
-        })
+            "dest_pdf_key": pdf_key,
+            "js_delay_ms": JS_DELAY_MS
+        }),
     }
