@@ -2,7 +2,6 @@ import os, json, boto3, pdfkit
 from datetime import datetime
 from botocore.exceptions import ClientError
 
-# --- keep your 
 SRC_BUCKET      = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
 DEST_BUCKET     = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX     = os.environ.get("BASE_PREFIX", "uptime")
