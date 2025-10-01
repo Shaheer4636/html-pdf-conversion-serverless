@@ -1,18 +1,18 @@
-# lambda_function.py
 import os, json, boto3, pdfkit
 from datetime import datetime
 from botocore.exceptions import ClientError
 
-# --- your env vars (kept, even if some aren’t used here) ---
+# --- your env vars preserved ---
 SRC_BUCKET      = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
 DEST_BUCKET     = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
 BASE_PREFIX     = os.environ.get("BASE_PREFIX", "uptime")
 PDF_FORMAT      = os.environ.get("PDF_FORMAT",  "A4")
-JS_DELAY_MS     = int(os.environ.get("JS_DELAY_MS", "6000"))  # give charts time
+JS_DELAY_MS     = int(os.environ.get("JS_DELAY_MS", "6000"))  # allow JS charts to draw
 ALLOW_PDF_SKIP  = os.environ.get("ALLOW_PDF_SKIP", "false")
-PLAYWRIGHT_WAIT = os.environ.get("PLAYWRIGHT_WAIT", "domcontentloaded")  # ignored here
-# -----------------------------------------------------------
+PLAYWRIGHT_WAIT = os.environ.get("PLAYWRIGHT_WAIT", "domcontentloaded")  # unused here
+# --------------------------------
 
+# Lambda container: keep caches in /tmp
 os.environ.setdefault("HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
@@ -29,25 +29,31 @@ def _key(year, month, name):
     return f"{BASE_PREFIX}/{year}/{month}/{name}"
 
 def lambda_handler(event, context=None):
-    # allow explicit skip gate if you want it
+    # Optional skip gate
     if str(ALLOW_PDF_SKIP).lower() == "true":
-        return {"statusCode": 200, "headers": {"Content-Type":"application/json"},
-                "body": json.dumps({"skipped": True, "reason":"ALLOW_PDF_SKIP=true"})}
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"skipped": True, "reason": "ALLOW_PDF_SKIP=true"})
+        }
 
     year, month = _yyyymm(event or {})
     html_key = _key(year, month, "uptime-report.html")
     pdf_key  = _key(year, month, "uptime-report.pdf")
 
-    # fetch HTML
+    # Fetch HTML
     try:
         obj = s3.get_object(Bucket=SRC_BUCKET, Key=html_key)
     except ClientError as e:
-        return {"statusCode": 404, "headers": {"Content-Type":"application/json"},
-                "body": json.dumps({"error": f"Missing {SRC_BUCKET}/{html_key}", "detail": str(e)})}
+        return {
+            "statusCode": 404,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": f"Missing {SRC_BUCKET}/{html_key}", "detail": str(e)})
+        }
 
     html = obj["Body"].read().decode("utf-8", errors="ignore")
 
-    # copy HTML to dest for inspection
+    # Copy HTML to dest for inspection
     s3.copy_object(
         CopySource={"Bucket": SRC_BUCKET, "Key": html_key},
         Bucket=DEST_BUCKET, Key=html_key,
@@ -55,7 +61,7 @@ def lambda_handler(event, context=None):
         ContentType="text/html; charset=utf-8"
     )
 
-    # render with wkhtmltopdf
+    # wkhtmltopdf config
     config = pdfkit.configuration(wkhtmltopdf="/usr/local/bin/wkhtmltopdf")
     options = {
         "page-size": PDF_FORMAT,
@@ -66,13 +72,16 @@ def lambda_handler(event, context=None):
         "margin-right": "0mm",
         "margin-bottom": "0mm",
         "margin-left": "0mm",
+        # Give client-side JS time to finish (charts, fonts)
         "javascript-delay": str(JS_DELAY_MS),
-        # if your HTML sets window.status='done' when charts are finished, prefer:
+        # If your HTML sets: window.status='done' when finished, then prefer:
         # "window-status": "done"
     }
 
+    # Render
     pdf_bytes = pdfkit.from_string(html, False, options=options, configuration=config)
 
+    # Upload PDF
     s3.put_object(
         Bucket=DEST_BUCKET,
         Key=pdf_key,
