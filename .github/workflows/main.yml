@@ -23,13 +23,8 @@ env:
   DEST_BUCKET: pdf-uptime-reports-0000009
   BASE_PREFIX: uptime
   ALLOW_PDF_SKIP: "false"
-  PLAYWRIGHT_WAIT: domcontentloaded        # kept for compatibility (unused)
+  PLAYWRIGHT_WAIT: domcontentloaded   # ignored by wkhtmltopdf (kept for compatibility)
   PDF_FORMAT: A4
-  # New (wkhtmltopdf) envs:
-  JS_DELAY_MS: "5000"                      # wait for JS charts to paint
-  WINDOW_STATUS: ""                        # set to "done" if your page sets window.status='done'
-  PDF_ORIENTATION: "Portrait"              # or "Landscape"
-  DISABLE_SMART_SHRINKING: "false"
 
 jobs:
   deploy:
@@ -70,29 +65,44 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # === NEW: fetch wkhtmltopdf tarball into build context ===
-      - name: Prepare wkhtmltopdf artifact
+      # >>> NEW: download wkhtmltopdf RPM into ./tools (picked from official releases)
+      - name: Download wkhtmltopdf RPM
         run: |
           set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
           mkdir -p tools
-          urls=(
-            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1/wkhtmltox-0.12.6.1-linux-generic-amd64.tar.xz"
-            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.linux-generic-amd64.tar.xz"
-            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.5-1/wkhtmltox-0.12.5-1.linux-generic-amd64.tar.xz"
-          )
-          for u in "${urls[@]}"; do
-            echo "Trying $u"
-            if curl -fL --retry 5 --retry-connrefused --retry-delay 2 -o tools/wkhtmltox.tar.xz "$u"; then
-              sz=$(wc -c < tools/wkhtmltox.tar.xz || echo 0)
-              if [ "$sz" -gt 10000000 ]; then
-                echo "Downloaded wkhtmltopdf tarball ($sz bytes)"
-                exit 0
+          found=""
+          # Try a few likely tags (newest first), fall back to querying all releases
+          for tag in 0.12.6.1-2 0.12.6.1 0.12.6-1; do
+            if url=$(curl -fsSL "https://api.github.com/repos/wkhtmltopdf/packaging/releases/tags/${tag}" \
+              | jq -r '.assets[]?.browser_download_url' \
+              | grep -E 'wkhtmltox-.*(almalinux9|amazonlinux2).*\.x86_64\.rpm' \
+              | head -n1); then
+              if [ -n "$url" ]; then
+                echo "Tag ${tag}: $url"
+                curl -fSL "$url" -o tools/wkhtmltox.rpm
+                found="1"
+                break
               fi
             fi
-            rm -f tools/wkhtmltox.tar.xz || true
           done
-          echo "FATAL: could not download wkhtmltopdf tarball" >&2
-          exit 1
+          if [ -z "${found}" ]; then
+            # fallback: scan latest 5 releases
+            for page in 1 2; do
+              url=$(curl -fsSL "https://api.github.com/repos/wkhtmltopdf/packaging/releases?per_page=5&page=${page}" \
+                | jq -r '.[].assets[]?.browser_download_url' \
+                | grep -E 'wkhtmltox-.*(almalinux9|amazonlinux2).*\.x86_64\.rpm' \
+                | head -n1 || true)
+              if [ -n "$url" ]; then
+                echo "From releases list: $url"
+                curl -fSL "$url" -o tools/wkhtmltox.rpm
+                found="1"
+                break
+              fi
+            done
+          fi
+          test -s tools/wkhtmltox.rpm || { echo "FATAL: could not find wkhtmltopdf rpm asset"; exit 1; }
 
       - name: Build and push image
         env:
@@ -138,11 +148,7 @@ jobs:
               BASE_PREFIX=${BASE_PREFIX},
               ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
               PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
-              PDF_FORMAT=${PDF_FORMAT},
-              JS_DELAY_MS=${JS_DELAY_MS},
-              WINDOW_STATUS=${WINDOW_STATUS},
-              PDF_ORIENTATION=${PDF_ORIENTATION},
-              DISABLE_SMART_SHRINKING=${DISABLE_SMART_SHRINKING}
+              PDF_FORMAT=${PDF_FORMAT}
             }" \
             --region "${AWS_REGION}"
           echo "JUST_CREATED=1" >> $GITHUB_ENV
@@ -167,11 +173,7 @@ jobs:
               BASE_PREFIX=${BASE_PREFIX},
               ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
               PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
-              PDF_FORMAT=${PDF_FORMAT},
-              JS_DELAY_MS=${JS_DELAY_MS},
-              WINDOW_STATUS=${WINDOW_STATUS},
-              PDF_ORIENTATION=${PDF_ORIENTATION},
-              DISABLE_SMART_SHRINKING=${DISABLE_SMART_SHRINKING}
+              PDF_FORMAT=${PDF_FORMAT}
             }" \
             --region "${AWS_REGION}"
           echo "JUST_CREATED=1" >> $GITHUB_ENV
@@ -208,11 +210,7 @@ jobs:
                 BASE_PREFIX=${BASE_PREFIX},
                 ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
                 PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
-                PDF_FORMAT=${PDF_FORMAT},
-                JS_DELAY_MS=${JS_DELAY_MS},
-                WINDOW_STATUS=${WINDOW_STATUS},
-                PDF_ORIENTATION=${PDF_ORIENTATION},
-                DISABLE_SMART_SHRINKING=${DISABLE_SMART_SHRINKING}
+                PDF_FORMAT=${PDF_FORMAT}
               }" \
               --region "${AWS_REGION}"; then
               echo "Config updated."; break
