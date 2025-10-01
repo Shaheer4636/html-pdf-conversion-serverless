@@ -23,8 +23,13 @@ env:
   DEST_BUCKET: pdf-uptime-reports-0000009
   BASE_PREFIX: uptime
   ALLOW_PDF_SKIP: "false"
-  PLAYWRIGHT_WAIT: domcontentloaded
+  PLAYWRIGHT_WAIT: domcontentloaded        # kept for compatibility (unused)
   PDF_FORMAT: A4
+  # New (wkhtmltopdf) envs:
+  JS_DELAY_MS: "5000"                      # wait for JS charts to paint
+  WINDOW_STATUS: ""                        # set to "done" if your page sets window.status='done'
+  PDF_ORIENTATION: "Portrait"              # or "Landscape"
+  DISABLE_SMART_SHRINKING: "false"
 
 jobs:
   deploy:
@@ -65,6 +70,30 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # === NEW: fetch wkhtmltopdf tarball into build context ===
+      - name: Prepare wkhtmltopdf artifact
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          urls=(
+            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1/wkhtmltox-0.12.6.1-linux-generic-amd64.tar.xz"
+            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.linux-generic-amd64.tar.xz"
+            "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.5-1/wkhtmltox-0.12.5-1.linux-generic-amd64.tar.xz"
+          )
+          for u in "${urls[@]}"; do
+            echo "Trying $u"
+            if curl -fL --retry 5 --retry-connrefused --retry-delay 2 -o tools/wkhtmltox.tar.xz "$u"; then
+              sz=$(wc -c < tools/wkhtmltox.tar.xz || echo 0)
+              if [ "$sz" -gt 10000000 ]; then
+                echo "Downloaded wkhtmltopdf tarball ($sz bytes)"
+                exit 0
+              fi
+            fi
+            rm -f tools/wkhtmltox.tar.xz || true
+          done
+          echo "FATAL: could not download wkhtmltopdf tarball" >&2
+          exit 1
+
       - name: Build and push image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -90,7 +119,6 @@ jobs:
             echo "pkgType=NONE" >> $GITHUB_OUTPUT
           fi
 
-      # Create if missing (container)
       - name: Create function (container)
         if: steps.pkg.outputs.pkgType == 'NONE'
         run: |
@@ -110,12 +138,15 @@ jobs:
               BASE_PREFIX=${BASE_PREFIX},
               ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
               PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
-              PDF_FORMAT=${PDF_FORMAT}
+              PDF_FORMAT=${PDF_FORMAT},
+              JS_DELAY_MS=${JS_DELAY_MS},
+              WINDOW_STATUS=${WINDOW_STATUS},
+              PDF_ORIENTATION=${PDF_ORIENTATION},
+              DISABLE_SMART_SHRINKING=${DISABLE_SMART_SHRINKING}
             }" \
             --region "${AWS_REGION}"
           echo "JUST_CREATED=1" >> $GITHUB_ENV
 
-      # If current function is Zip, delete and recreate as container (same name)
       - name: Recreate ZIP function as container (same name)
         if: steps.pkg.outputs.pkgType == 'Zip'
         run: |
@@ -136,12 +167,15 @@ jobs:
               BASE_PREFIX=${BASE_PREFIX},
               ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
               PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
-              PDF_FORMAT=${PDF_FORMAT}
+              PDF_FORMAT=${PDF_FORMAT},
+              JS_DELAY_MS=${JS_DELAY_MS},
+              WINDOW_STATUS=${WINDOW_STATUS},
+              PDF_ORIENTATION=${PDF_ORIENTATION},
+              DISABLE_SMART_SHRINKING=${DISABLE_SMART_SHRINKING}
             }" \
             --region "${AWS_REGION}"
           echo "JUST_CREATED=1" >> $GITHUB_ENV
 
-      # If already container, just update to new image
       - name: Update code (container)
         if: steps.pkg.outputs.pkgType == 'Image'
         run: |
@@ -152,18 +186,13 @@ jobs:
             --region "${AWS_REGION}"
           echo "JUST_UPDATED_CODE=1" >> $GITHUB_ENV
 
-      # Robust readiness waiters after create/recreate or code update
       - name: Wait until function is ready
         run: |
           set -euo pipefail
-          # Wait for Active
           aws lambda wait function-active --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}"
-          # Wait for Updated (handles "update in progress" conflicts)
           aws lambda wait function-updated --function-name "${LAMBDA_FUNC}" --region "${AWS_REGION}"
-          # Small buffer
           sleep 5
 
-      # Update env/memory/timeout with retries to avoid ResourceConflict
       - name: Update configuration (env/memory/timeout)
         run: |
           set -euo pipefail
@@ -179,7 +208,11 @@ jobs:
                 BASE_PREFIX=${BASE_PREFIX},
                 ALLOW_PDF_SKIP=${ALLOW_PDF_SKIP},
                 PLAYWRIGHT_WAIT=${PLAYWRIGHT_WAIT},
-                PDF_FORMAT=${PDF_FORMAT}
+                PDF_FORMAT=${PDF_FORMAT},
+                JS_DELAY_MS=${JS_DELAY_MS},
+                WINDOW_STATUS=${WINDOW_STATUS},
+                PDF_ORIENTATION=${PDF_ORIENTATION},
+                DISABLE_SMART_SHRINKING=${DISABLE_SMART_SHRINKING}
               }" \
               --region "${AWS_REGION}"; then
               echo "Config updated."; break
