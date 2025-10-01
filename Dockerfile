@@ -1,7 +1,7 @@
 # Lambda base (Amazon Linux 2023)
 FROM public.ecr.aws/lambda/python:3.12
 
-# Fonts + render libs (no curl drama)
+# Fonts + render libs (no curl needed)
 RUN dnf -y install \
       fontconfig freetype cairo harfbuzz \
       dejavu-sans-fonts dejavu-serif-fonts \
@@ -10,12 +10,33 @@ RUN dnf -y install \
       xz tar libjpeg-turbo \
     && dnf clean all
 
-# Install wkhtmltopdf (CentOS 8 RPM works on AL2023). Try 0.12.6-1, fall back to 0.12.5-1.
+# Install wkhtmltopdf by DOWNLOADING the RPM, then local-install it.
+# We try 0.12.6-1 first, then 0.12.5-1 as a fallback.
 RUN set -eux; \
-  RPM1="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.centos8.x86_64.rpm"; \
-  RPM2="https://github.com/wkhtmltopdf/packaging/releases/download/0.12.5-1/wkhtmltox-0.12.5-1.centos8.x86_64.rpm"; \
-  dnf -y install "${RPM1}" || dnf -y install "${RPM2}"; \
-  /usr/local/bin/wkhtmltopdf --version
+  python - <<'PY' \
+import os, sys, urllib.request, shutil, ssl, tempfile, pathlib, subprocess, stat
+urls = [
+  "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox-0.12.6-1.centos8.x86_64.rpm",
+  "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.5-1/wkhtmltox-0.12.5-1.centos8.x86_64.rpm",
+]
+dest = "/tmp/wkhtmltox.rpm"
+ctx = ssl.create_default_context()
+for u in urls:
+    try:
+        with urllib.request.urlopen(u, context=ctx, timeout=120) as r, open(dest, "wb") as f:
+            shutil.copyfileobj(r, f)
+        if os.path.getsize(dest) > 10_000_000:
+            break
+    except Exception:
+        try: os.remove(dest)
+        except: pass
+        dest = "/tmp/wkhtmltox.rpm"
+        continue
+if not (os.path.exists(dest) and os.path.getsize(dest) > 10_000_000):
+    print("FATAL: could not download wkhtmltopdf RPM", file=sys.stderr); sys.exit(1)
+PY \
+  && dnf -y install /tmp/wkhtmltox.rpm \
+  && /usr/local/bin/wkhtmltopdf --version
 
 WORKDIR /var/task
 COPY requirements.txt .
