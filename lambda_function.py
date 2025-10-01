@@ -2,77 +2,96 @@ import os, json, boto3, pdfkit
 from datetime import datetime
 from botocore.exceptions import ClientError
 
-# ------------ ENV -------------
-SRC_BUCKET  = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
-DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
-BASE_PREFIX = os.environ.get("BASE_PREFIX", "uptime")
-PDF_FORMAT  = os.environ.get("PDF_FORMAT",  "A4")  # A4, Letter, etc.
-JS_DELAY_MS = int(os.environ.get("JS_DELAY_MS", "4000"))  # time for JS charts to draw
-# --------------------------------
+# --------- ENV (kept as you wanted) ----------
+SRC_BUCKET   = os.environ.get("SRC_BUCKET",  "lambda-output-report-000000987123")
+DEST_BUCKET  = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
+BASE_PREFIX  = os.environ.get("BASE_PREFIX", "uptime")
+PDF_FORMAT   = os.environ.get("PDF_FORMAT",  "A4")   # A4/Letter
+JS_DELAY_MS  = int(os.environ.get("JS_DELAY_MS", "5000"))  # ms to let JS draw
+WINDOW_STATUS = os.environ.get("WINDOW_STATUS", "")  # e.g. set to "done" if your page sets window.status='done'
+DISABLE_SMART_SHRINKING = os.environ.get("DISABLE_SMART_SHRINKING", "false").lower() == "true"
+ORIENTATION = os.environ.get("PDF_ORIENTATION", "Portrait")  # Portrait/Landscape
 
-# Lambda container: caches/fonts to /tmp
+# writeable caches in Lambda
+os.makedirs("/tmp/.cache/fontconfig", exist_ok=True)
 os.environ.setdefault("HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
 
 s3 = boto3.client("s3")
 
-def _ym(event):
+def _ym(event: dict):
     now = datetime.utcnow()
-    year = str((event or {}).get("year") or now.year).zfill(4)
-    month = str((event or {}).get("month") or now.month).zfill(2)
-    return year, month
+    y = str(event.get("year")  or now.year).zfill(4)
+    m = str(event.get("month") or now.month).zfill(2)
+    return y, m
 
-def _key(year, month, name): 
-    return f"{BASE_PREFIX}/{year}/{month}/{name}"
+def _key(y, m, name): return f"{BASE_PREFIX}/{y}/{m}/{name}"
 
-def lambda_handler(event, context=None):
-    year, month = _ym(event)
-    html_key = _key(year, month, "uptime-report.html")
-    pdf_key  = _key(year, month, "uptime-report.pdf")
+def _pdf_options():
+    # These flags closely match browser print behavior
+    opts = {
+        "page-size": PDF_FORMAT,
+        "orientation": ORIENTATION,
+        "print-media-type": None,
+        "enable-local-file-access": None,
+        "encoding": "UTF-8",
+        "margin-top": "0mm", "margin-right": "0mm",
+        "margin-bottom": "0mm", "margin-left": "0mm",
+        "dpi": "96",
+    }
+    if DISABLE_SMART_SHRINKING:
+        opts["disable-smart-shrinking"] = None
+    if WINDOW_STATUS:
+        opts["window-status"] = WINDOW_STATUS
+    else:
+        opts["javascript-delay"] = str(JS_DELAY_MS)
+        # opts["no-stop-slow-scripts"] = None  # uncomment if needed
+    return opts
 
-    # 1) fetch HTML from source bucket
+def handler(event, context=None):
+    y, m = _ym(event or {})
+    html_key = _key(y, m, "uptime-report.html")
+    pdf_key  = _key(y, m, "uptime-report.pdf")
+
+    # 1) fetch html
     try:
         obj = s3.get_object(Bucket=SRC_BUCKET, Key=html_key)
     except ClientError as e:
         return {
             "statusCode": 404,
-            "headers": {"Content-Type": "application/json"},
+            "headers": {"Content-Type":"application/json"},
             "body": json.dumps({"error": f"Missing {SRC_BUCKET}/{html_key}", "detail": str(e)})
         }
-
     html = obj["Body"].read().decode("utf-8", errors="ignore")
 
-    # 2) copy HTML to dest for inspection
-    s3.copy_object(
-        CopySource={"Bucket": SRC_BUCKET, "Key": html_key},
-        Bucket=DEST_BUCKET, Key=html_key,
-        MetadataDirective="REPLACE",
-        ContentType="text/html; charset=utf-8"
-    )
+    # 2) copy html to dest for inspection
+    try:
+        s3.copy_object(
+            CopySource={"Bucket": SRC_BUCKET, "Key": html_key},
+            Bucket=DEST_BUCKET, Key=html_key,
+            MetadataDirective="REPLACE",
+            ContentType="text/html; charset=utf-8"
+        )
+    except Exception:
+        # non-fatal; continue
+        pass
 
-    # 3) render to PDF with wkhtmltopdf via pdfkit
-    cfg = pdfkit.configuration(wkhtmltopdf="/usr/local/bin/wkhtmltopdf")
-    options = {
-        "page-size": PDF_FORMAT,
-        "print-media-type": None,
-        "enable-local-file-access": None,
-        "encoding": "UTF-8",
-        "margin-top": "0mm",
-        "margin-right": "0mm",
-        "margin-bottom": "0mm",
-        "margin-left": "0mm",
-        # let JS draw charts/canvas
-        "javascript-delay": str(JS_DELAY_MS),
-        # if your page sets window.status='done' when finished, you can use:
-        # "window-status": "done",
-        # "no-stop-slow-scripts": None,
-        # "load-error-handling": "ignore",
-    }
+    # 3) render via wkhtmltopdf
+    wkhtml = "/usr/local/bin/wkhtmltopdf"
+    config = pdfkit.configuration(wkhtmltopdf=wkhtml)
+    options = _pdf_options()
 
-    pdf_bytes = pdfkit.from_string(html, False, options=options, configuration=cfg)
+    try:
+        pdf_bytes = pdfkit.from_string(html, False, options=options, configuration=config)
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type":"application/json"},
+            "body": json.dumps({"error": f"PDF generation failed: {e.__class__.__name__}: {e}"})
+        }
 
-    # 4) upload PDF
+    # 4) upload pdf
     s3.put_object(
         Bucket=DEST_BUCKET,
         Key=pdf_key,
@@ -86,10 +105,12 @@ def lambda_handler(event, context=None):
         "body": json.dumps({
             "src_bucket": SRC_BUCKET,
             "dest_bucket": DEST_BUCKET,
-            "prefix": f"{BASE_PREFIX}/{year}/{month}/",
+            "prefix": f"{BASE_PREFIX}/{y}/{m}/",
             "html_key": html_key,
             "dest_html_key": html_key,
             "dest_pdf_key": pdf_key,
-            "js_delay_ms": JS_DELAY_MS
+            "js_delay_ms": JS_DELAY_MS,
+            "window_status": WINDOW_STATUS or None,
+            "smart_shrinking_disabled": DISABLE_SMART_SHRINKING
         })
     }
