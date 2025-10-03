@@ -1,14 +1,8 @@
 terraform {
   required_version = ">= 1.6.0"
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">= 5.40.0"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = ">= 3.5.1"
-    }
+    aws = { source = "hashicorp/aws",  version = ">= 5.40.0" }
+    random = { source = "hashicorp/random", version = ">= 3.5.1" }
   }
 }
 
@@ -16,13 +10,15 @@ provider "aws" {
   region = var.region
 }
 
-# Optional short random suffix to guarantee global uniqueness
+# Optional short random suffix to ensure global bucket uniqueness
 resource "random_id" "suffix" {
   count       = var.add_random_suffix ? 1 : 0
   byte_length = 2
 }
 
-# locals (drop all regexreplace/trim usage)
+# ---------------------------
+# Locals (no regex functions)
+# ---------------------------
 locals {
   # Prefix with optional short random suffix, then lowercase
   unique_prefix = lower(
@@ -42,8 +38,13 @@ locals {
   # Enforce 63-char S3 bucket limit
   canary_bucket_name = substr(local.canary_name_norm, 0, 63)
   report_bucket_name = substr(local.report_name_norm, 0, 63)
-}
 
+  # Common tags (this was missing)
+  common_tags = merge(var.tags, {
+    Project = var.name_prefix
+    Region  = var.region
+  })
+}
 
 # ---------------------------
 # Canary artifacts bucket
@@ -75,9 +76,7 @@ resource "aws_s3_bucket_versioning" "canary" {
 resource "aws_s3_bucket_server_side_encryption_configuration" "canary" {
   bucket = aws_s3_bucket.canary.id
   rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
   }
 }
 
@@ -111,9 +110,7 @@ resource "aws_s3_bucket_versioning" "report" {
 resource "aws_s3_bucket_server_side_encryption_configuration" "report" {
   bucket = aws_s3_bucket.report.id
   rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
+    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
   }
 }
 
