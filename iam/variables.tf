@@ -36,9 +36,9 @@ variable "artifact_bucket" {
 }
 
 variable "artifact_prefix" {
-  description = "S3 key prefix for artifacts (no trailing slash)"
+  description = "S3 prefix where canary artifacts live"
   type        = string
-  default     = "canary/${var.region}/clonerainthoscom"
+  default     = ""    # value comes from terraform.tfvars or TF_VAR_artifact_prefix
 }
 
 variable "runtime_version" {
