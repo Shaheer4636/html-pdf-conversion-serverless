@@ -10,7 +10,7 @@ PDF_FORMAT  = os.environ.get("PDF_FORMAT",  "A4")
 JS_DELAY_MS = int(os.environ.get("JS_DELAY_MS", "5000"))  # give JS time to paint
 WKHTMLTOPDF_BIN = os.environ.get("WKHTMLTOPDF_BIN", "/usr/bin/wkhtmltopdf")  # from Ubuntu package
 
-# Caches/fonts live in /tmp in Lambda
+
 os.environ.setdefault("HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
