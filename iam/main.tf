@@ -21,7 +21,7 @@ provider "aws" {
   region = var.region
 }
 
-# ---- Unique name handling (prevents EntityAlreadyExists) ----
+# ---- Unique name handling (pre
 resource "random_id" "suffix" {
   count       = var.add_random_suffix ? 1 : 0
   byte_length = 2
