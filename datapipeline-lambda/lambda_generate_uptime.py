@@ -1,4 +1,4 @@
-# === CONFIG VIA ENV ===
+# === CONFIG VIA ENV
 import os
 ART_BUCKET     = os.getenv("ART_BUCKET", "change-me")
 ART_PREFIX     = os.getenv("ART_PREFIX", "canary/us-east-1/your-prefix")
