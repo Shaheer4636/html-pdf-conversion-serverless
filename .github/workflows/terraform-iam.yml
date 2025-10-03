@@ -2,97 +2,112 @@ name: terraform-iam
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
     paths:
-      - 'iam/**'
-      - '.github/workflows/terraform-iam.yml'
+      - "iam/**"
+      - ".github/workflows/terraform-iam.yml"
   pull_request:
-    branches: [ main ]
+    branches: [ "main" ]
     paths:
-      - 'iam/**'
-      - '.github/workflows/terraform-iam.yml'
-  workflow_dispatch: {}
+      - "iam/**"
+      - ".github/workflows/terraform-iam.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: write
-  id-token: write
 
 concurrency:
   group: terraform-iam-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  TF_VERSION: '1.6.6'
+  TF_VERSION: "1.6.6"
   WORKDIR: iam
+  AWS_REGION: "us-east-1"          # change if needed
   TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
-  # Use repo variable if set, else default
-  AWS_REGION: ${{ vars.AWS_REGION != '' && vars.AWS_REGION || 'us-east-1' }}
 
 jobs:
   plan:
-    name: Terraform Plan (PR)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (static keys)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
-        with: { terraform_version: ${{ env.TF_VERSION }} }
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - uses: actions/cache@v4
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: ${{ runner.os }}-tf-${{ hashFiles('iam/.terraform.lock.hcl') }}
-          restore-keys: ${{ runner.os }}-tf-
+          restore-keys: |
+            ${{ runner.os }}-tf-
 
-      - run: terraform fmt -check -recursive
+      - name: Terraform fmt
         working-directory: ${{ env.WORKDIR }}
+        run: terraform fmt -check -recursive
 
-      - run: terraform init -input=false
+      - name: Terraform init
         working-directory: ${{ env.WORKDIR }}
+        run: terraform init -input=false
 
-      - run: terraform validate -no-color
+      - name: Terraform validate
         working-directory: ${{ env.WORKDIR }}
+        run: terraform validate -no-color
 
-      - run: terraform plan -input=false -no-color -out=tfplan
+      - name: Terraform plan
         working-directory: ${{ env.WORKDIR }}
+        run: terraform plan -input=false -no-color -out=tfplan
 
-      - uses: actions/upload-artifact@v4
-        with: { name: iam-tfplan, path: iam/tfplan }
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: iam-tfplan
+          path: iam/tfplan
 
   apply:
-    name: Terraform Apply (main)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (static keys)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
-        with: { terraform_version: ${{ env.TF_VERSION }} }
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - uses: actions/cache@v4
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: ${{ runner.os }}-tf-${{ hashFiles('iam/.terraform.lock.hcl') }}
-          restore-keys: ${{ runner.os }}-tf-
+          restore-keys: |
+            ${{ runner.os }}-tf-
 
-      - run: terraform init -input=false
+      - name: Terraform init
         working-directory: ${{ env.WORKDIR }}
+        run: terraform init -input=false
 
-      - run: terraform apply -input=false -auto-approve
+      - name: Terraform apply
         working-directory: ${{ env.WORKDIR }}
+        run: terraform apply -input=false -auto-approve
