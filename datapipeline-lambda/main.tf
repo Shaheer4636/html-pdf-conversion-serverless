@@ -27,7 +27,7 @@ locals {
   art_prefix = var.artifact_prefix != "" ? var.artifact_prefix : "canary/${var.region}/${var.name_prefix}"
 }
 
-# Package the Python file as lambda_function.py
+# Package the Python file
 data "archive_file" "zip" {
   type        = "zip"
   output_path = "${path.module}/lambda.zip"
