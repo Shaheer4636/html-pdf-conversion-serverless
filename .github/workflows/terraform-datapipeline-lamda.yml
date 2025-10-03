@@ -1,0 +1,122 @@
+name: terraform-datapipeline-lambda
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "html-pdf-conversion-serverless/datapipeline-lambda/**"
+      - ".github/workflows/terraform-datapipeline-lambda.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "html-pdf-conversion-serverless/datapipeline-lambda/**"
+      - ".github/workflows/terraform-datapipeline-lambda.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+env:
+  TF_VERSION: "1.6.6"
+  WORKDIR: html-pdf-conversion-serverless/datapipeline-lambda
+  AWS_REGION: ${{ vars.AWS_REGION != '' && vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure required repo variables exist
+        run: |
+          set -e
+          [ -n "${{ vars.LAMBDA_ROLE_ARN_DataPipeline }}" ] || { echo "Missing repo variable LAMBDA_ROLE_ARN_DataPipeline"; exit 1; }
+          [ -n "${{ vars.CANARY_BUCKET_NAME }}" ] || { echo "Missing repo variable CANARY_BUCKET_NAME"; exit 1; }
+          [ -n "${{ vars.REPORT_BUCKET_NAME }}" ] || { echo "Missing repo variable REPORT_BUCKET_NAME"; exit 1; }
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Export TF_VAR_* (from repo variables)
+        run: |
+          echo "TF_VAR_region=${{ env.AWS_REGION }}" >> $GITHUB_ENV
+          echo "TF_VAR_lambda_role_arn=${{ vars.LAMBDA_ROLE_ARN_DataPipeline }}" >> $GITHUB_ENV
+          echo "TF_VAR_artifact_bucket=${{ vars.CANARY_BUCKET_NAME }}" >> $GITHUB_ENV
+          echo "TF_VAR_reports_bucket=${{ vars.REPORT_BUCKET_NAME }}" >> $GITHUB_ENV
+
+      - name: Terraform fmt
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform plan -input=false -no-color -out=tfplan
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: datapipeline-lambda-tfplan
+          path: html-pdf-conversion-serverless/datapipeline-lambda/tfplan
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure required repo variables exist
+        run: |
+          set -e
+          [ -n "${{ vars.LAMBDA_ROLE_ARN_DataPipeline }}" ] || { echo "Missing repo variable LAMBDA_ROLE_ARN_DataPipeline"; exit 1; }
+          [ -n "${{ vars.CANARY_BUCKET_NAME }}" ] || { echo "Missing repo variable CANARY_BUCKET_NAME"; exit 1; }
+          [ -n "${{ vars.REPORT_BUCKET_NAME }}" ] || { echo "Missing repo variable REPORT_BUCKET_NAME"; exit 1; }
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Export TF_VAR_* (from repo variables)
+        run: |
+          echo "TF_VAR_region=${{ env.AWS_REGION }}" >> $GITHUB_ENV
+          echo "TF_VAR_lambda_role_arn=${{ vars.LAMBDA_ROLE_ARN_DataPipeline }}" >> $GITHUB_ENV
+          echo "TF_VAR_artifact_bucket=${{ vars.CANARY_BUCKET_NAME }}" >> $GITHUB_ENV
+          echo "TF_VAR_reports_bucket=${{ vars.REPORT_BUCKET_NAME }}" >> $GITHUB_ENV
+
+      - name: Terraform init
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform apply -input=false -auto-approve
+
+      - name: Show outputs
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          echo "### Lambda Outputs" >> $GITHUB_STEP_SUMMARY
+          terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> $GITHUB_STEP_SUMMARY
