@@ -1,113 +1,90 @@
-name: terraform-iam
+name: terraform-iam-vars
 
 on:
   push:
     branches: [ "main" ]
-    paths:
-      - "iam/**"
-      - ".github/workflows/terraform-iam.yml"
+    paths: [ "iam/**", ".github/workflows/terraform-iam-vars.yml" ]
   pull_request:
     branches: [ "main" ]
-    paths:
-      - "iam/**"
-      - ".github/workflows/terraform-iam.yml"
-  workflow_dispatch:
+    paths: [ "iam/**", ".github/workflows/terraform-iam-vars.yml" ]
 
 permissions:
   contents: read
-  pull-requests: write
-
-concurrency:
-  group: terraform-iam-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   TF_VERSION: "1.6.6"
   WORKDIR: iam
-  AWS_REGION: "us-east-1"          # change if needed
-  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+  AWS_REGION: "us-east-1"   # or set as repo Variable and keep this line
 
 jobs:
-  plan:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Cache Terraform plugins
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: ${{ runner.os }}-tf-${{ hashFiles('iam/.terraform.lock.hcl') }}
-          restore-keys: |
-            ${{ runner.os }}-tf-
-
-      - name: Terraform fmt
-        working-directory: ${{ env.WORKDIR }}
-        run: terraform fmt -check -recursive
-
-      - name: Terraform init
-        working-directory: ${{ env.WORKDIR }}
-        run: terraform init -input=false
-
-      - name: Terraform validate
-        working-directory: ${{ env.WORKDIR }}
-        run: terraform validate -no-color
-
-      - name: Terraform plan
-        working-directory: ${{ env.WORKDIR }}
-        run: terraform plan -input=false -no-color -out=tfplan
-
-      - name: Upload plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: iam-tfplan
-          path: iam/tfplan
-
   apply:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
+      SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Validate repo variables
+        run: |
+          set -euo pipefail
+          [ -n "${AKI:-}" ] || { echo "Missing repo variable AWS_ACCESS_KEY_ID"; exit 1; }
+          [ -n "${SAK:-}" ] || { echo "Missing repo variable AWS_SECRET_ACCESS_KEY"; exit 1; }
+          [ -n "${AWS_REGION:-}" ] || { echo "Missing AWS_REGION (env or Variable)"; exit 1; }
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id:     ${{ env.AKI }}
+          aws-secret-access-key: ${{ env.SAK }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Cache Terraform plugins
-        uses: actions/cache@v4
+      - run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+
+      - run: terraform apply -input=false -auto-approve
+        working-directory: ${{ env.WORKDIR }}
+
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
+      SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate repo variables
+        run: |
+          set -euo pipefail
+          [ -n "${AKI:-}" ] || { echo "Missing repo variable AWS_ACCESS_KEY_ID"; exit 1; }
+          [ -n "${SAK:-}" ] || { echo "Missing repo variable AWS_SECRET_ACCESS_KEY"; exit 1; }
+          [ -n "${AWS_REGION:-}" ] || { echo "Missing AWS_REGION (env or Variable)"; exit 1; }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: ${{ runner.os }}-tf-${{ hashFiles('iam/.terraform.lock.hcl') }}
-          restore-keys: |
-            ${{ runner.os }}-tf-
+          aws-access-key-id:     ${{ env.AKI }}
+          aws-secret-access-key: ${{ env.SAK }}
+          aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Terraform init
-        working-directory: ${{ env.WORKDIR }}
-        run: terraform init -input=false
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Terraform apply
+      - run: terraform fmt -check -recursive
         working-directory: ${{ env.WORKDIR }}
-        run: terraform apply -input=false -auto-approve
+
+      - run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+
+      - run: terraform validate -no-color
+        working-directory: ${{ env.WORKDIR }}
+
+      - run: terraform plan -input=false -no-color -out=tfplan
+        working-directory: ${{ env.WORKDIR }}
