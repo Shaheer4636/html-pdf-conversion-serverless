@@ -1,0 +1,117 @@
+name: terraform-iam
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'iam/**'
+      - '.github/workflows/terraform-iam.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'iam/**'
+      - '.github/workflows/terraform-iam.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: terraform-iam-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: '1.6.6'
+  WORKDIR: iam
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+  # If your Terraform has a variable "lambda_role_arn", uncomment the next line.
+  # TF_VAR_lambda_role_arn: ${{ vars.LAMBDA_ROLE_ARN }}
+
+jobs:
+  plan:
+    name: Terraform Plan (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ vars.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: ${{ runner.os }}-tf-${{ hashFiles('iam/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-tf-
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: terraform init
+        run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: terraform validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: terraform plan
+        run: terraform plan -input=false -no-color -out=tfplan
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: iam-tfplan
+          path: iam/tfplan
+
+  apply:
+    name: Terraform Apply (main)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ vars.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: ${{ runner.os }}-tf-${{ hashFiles('iam/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-tf-
+
+      - name: terraform init
+        run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: terraform apply
+        run: terraform apply -input=false -auto-approve
+        working-directory: ${{ env.WORKDIR }}
