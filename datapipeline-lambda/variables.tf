@@ -43,16 +43,41 @@ variable "reports_prefix" {
   default     = "uptime"
 }
 
-# Optional presentation / behavior
-variable "company"       { type = string, default = "Situs-AMC" }
-variable "service"       { type = string, default = "Useful App" }
-variable "client"        { type = string, default = "CitiBank" }
-variable "only_browser"  { type = string, default = "ANY" }
-variable "fail_streak"   { type = number, default = 3 }
-variable "treat_missing" { type = bool,   default = false }
-variable "slo_target"    { type = string, default = "auto" }
+variable "company" {
+  type        = string
+  default     = "Situs-AMC"
+}
 
-# The Python source file path (relative to this folder)
+variable "service" {
+  type        = string
+  default     = "Useful App"
+}
+
+variable "client" {
+  type        = string
+  default     = "CitiBank"
+}
+
+variable "only_browser" {
+  type        = string
+  default     = "ANY"
+}
+
+variable "fail_streak" {
+  type        = number
+  default     = 3
+}
+
+variable "treat_missing" {
+  type        = bool
+  default     = false
+}
+
+variable "slo_target" {
+  type        = string
+  default     = "auto"
+}
+
 variable "source_py" {
   description = "Path to lambda_generate_uptime.py"
   type        = string
