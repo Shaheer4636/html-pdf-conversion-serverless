@@ -16,6 +16,7 @@ resource "random_id" "suffix" {
   byte_length = 2
 }
 
+#locals
 locals {
   fn_name = lower(
     var.add_random_suffixterraform {
