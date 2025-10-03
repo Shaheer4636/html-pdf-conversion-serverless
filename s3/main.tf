@@ -22,26 +22,28 @@ resource "random_id" "suffix" {
   byte_length = 2
 }
 
+# locals (drop all regexreplace/trim usage)
 locals {
-  # Build a unique, DNS-safe prefix
-  unique_prefix_raw = var.add_random_suffix ? "${var.name_prefix}-${random_id.suffix[0].hex}" : var.name_prefix
-  unique_prefix     = lower(regexreplace(local.unique_prefix_raw, "[^a-z0-9-]", "-"))
+  # Prefix with optional short random suffix, then lowercase
+  unique_prefix = lower(
+    var.add_random_suffix
+      ? "${var.name_prefix}-${random_id.suffix[0].hex}"
+      : var.name_prefix
+  )
 
-  base_canary = lower(regexreplace(var.canary_bucket_name, "[^a-z0-9-]", "-"))
-  base_report = lower(regexreplace(var.report_bucket_name, "[^a-z0-9-]", "-"))
+  # Build raw names
+  canary_name_raw = "${local.unique_prefix}-${var.canary_bucket_name}"
+  report_name_raw = "${local.unique_prefix}-${var.report_bucket_name}"
 
-  canary_candidate = "${local.unique_prefix}-${local.base_canary}"
-  report_candidate = "${local.unique_prefix}-${local.base_report}"
+  # Normalize: spaces/underscores → hyphens; lowercase
+  canary_name_norm = replace(replace(lower(local.canary_name_raw), " ", "-"), "_", "-")
+  report_name_norm = replace(replace(lower(local.report_name_raw), " ", "-"), "_", "-")
 
-  # S3 bucket name constraints (<= 63 chars, no leading/trailing '-')
-  canary_bucket_name = substr(trim(local.canary_candidate, "-"), 0, 63)
-  report_bucket_name = substr(trim(local.report_candidate, "-"), 0, 63)
-
-  common_tags = merge(var.tags, {
-    Project = var.name_prefix
-    Region  = var.region
-  })
+  # Enforce 63-char S3 bucket limit
+  canary_bucket_name = substr(local.canary_name_norm, 0, 63)
+  report_bucket_name = substr(local.report_name_norm, 0, 63)
 }
+
 
 # ---------------------------
 # Canary artifacts bucket
