@@ -52,9 +52,9 @@ variable "fail_streak"   { type = number, default = 3 }
 variable "treat_missing" { type = bool,   default = false }
 variable "slo_target"    { type = string, default = "auto" }
 
-# Where the Python file lives (relative to this folder)
+# The Python source file path (relative to this folder)
 variable "source_py" {
-  description = "Path to the lambda_generate_uptime.py file"
+  description = "Path to lambda_generate_uptime.py"
   type        = string
-  default     = "../lambda_generate_uptime.py"
+  default     = "lambda_generate_uptime.py"
 }
