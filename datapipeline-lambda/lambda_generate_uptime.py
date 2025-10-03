@@ -1,19 +1,19 @@
-# === EDIT THESE VALUES ===
-ART_BUCKET      = "canary-output-rainthos-009"
-ART_PREFIX      = "canary/us-east-1/clone2rainthos"   # folder *right above* the year
-REPORTS_BUCKET  = "lambda-output-report-000000987123"
-REPORTS_PREFIX  = "uptime"
+# === CONFIG VIA ENV ===
+import os
+ART_BUCKET     = os.getenv("ART_BUCKET", "change-me")
+ART_PREFIX     = os.getenv("ART_PREFIX", "canary/us-east-1/your-prefix")
+REPORTS_BUCKET = os.getenv("REPORTS_BUCKET", "change-me")
+REPORTS_PREFIX = os.getenv("REPORTS_PREFIX", "uptime")
 
-COMPANY         = "Situs-AMC"
-SERVICE         = "Useful App"
-CLIENT          = "CitiBank"
+COMPANY        = os.getenv("COMPANY", "Situs-AMC")
+SERVICE        = os.getenv("SERVICE", "Useful App")
+CLIENT         = os.getenv("CLIENT", "CitiBank")
 
-ONLY_BROWSER    = "ANY"       # e.g. "CHROME" if you have a browser subfolder, else "ANY"
-FAIL_STREAK     = 3           # minutes in a row that constitute an incident
-TREAT_MISSING   = False       # True: missing minutes count as failures
-
-SLO_TARGET      = "auto"      # "auto" for median of last 3 full months, or a float like 99.9
-# =========================
+ONLY_BROWSER   = os.getenv("ONLY_BROWSER", "ANY")
+FAIL_STREAK    = int(os.getenv("FAIL_STREAK", "3"))
+TREAT_MISSING  = os.getenv("TREAT_MISSING", "false").lower() == "true"
+SLO_TARGET     = os.getenv("SLO_TARGET", "auto")
+# ======================
 
 import os, json, re, csv, io, datetime, random
 from datetime import timezone, timedelta
