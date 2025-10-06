@@ -1,15 +1,4 @@
-Job plan_iam: Step task reference is invalid. The task name TerraformInstaller is ambiguous. Specify one of the following identifiers to resolve the ambiguity: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller, ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller, JasonBJohnson.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller
+SAMCObservability-492046385895-DEVOPSIACSVCVPC-Infrastructure Operations
 
-Job plan_iam: Step input awsCredentials references service connection SAMCObservability-492046385895-DEVOPSIACSCVPC-Infrastructure Operations which could not be found. The service connection does not exist, has been disabled or has not been authorized for use. For authorization details, refer to https://aka.ms/yamlauthz.
+SAMCObservability-492046385895-DEVOPSIACSVCVPC-us-east-1-Infrastructure Operations
 
-Job plan_s3: Step task reference is invalid. The task name TerraformInstaller is ambiguous. Specify one of the following identifiers to resolve the ambiguity: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller, ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller, JasonBJohnson.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller
-
-Job plan_s3: Step input awsCredentials references service connection SAMCObservability-492046385895-DEVOPSIACSCVPC-Infrastructure Operations which could not be found. The service connection does not exist, has been disabled or has not been authorized for use. For authorization details, refer to https://aka.ms/yamlauthz.
-
-Job apply_iam: Step task reference is invalid. The task name TerraformInstaller is ambiguous. Specify one of the following identifiers to resolve the ambiguity: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller, ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller, JasonBJohnson.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller
-
-Job apply_iam: Step input awsCredentials references service connection SAMCObservability-492046385895-DEVOPSIACSCVPC-Infrastructure Operations which could not be found. The service connection does not exist, has been disabled or has not been authorized for use. For authorization details, refer to https://aka.ms/yamlauthz.
-
-Job apply_s3: Step task reference is invalid. The task name TerraformInstaller is ambiguous. Specify one of the following identifiers to resolve the ambiguity: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller, ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller, JasonBJohnson.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller
-
-Job apply_s3: Step input awsCredentials references service connection SAMCObservability-492046385895-DEVOPSIACSCVPC-Infrastructure Operations which could not be found. The service connection does not exist, has been disabled or has not been authorized for use. For authorization details, refer to https://aka.ms/yamlauthz.
