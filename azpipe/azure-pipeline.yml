@@ -1,4 +1,231 @@
-SAMCObservability-492046385895-DEVOPSIACSVCVPC-Infrastructure Operations
+# azure-pipelines.yml
+name: terraform-infra
 
-SAMCObservability-492046385895-DEVOPSIACSVCVPC-us-east-1-Infrastructure Operations
+trigger:
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - .azure-pipelines/terraform-infra.yml
 
+pr:
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - .azure-pipelines/terraform-infra.yml
+
+variables:
+  tfVersion: "1.13.3"
+  awsRegion: "us-east-1"
+
+  # EXACT service connection display names you provided
+  awsServiceConnectionIAM:  "SAMCObservability-492046385895-DEVOPSIACSVCVPC-Infrastructure Operations"
+  awsServiceConnectionUSE1: "SAMCObservability-492046385895-DEVOPSIACSVCVPC-us-east-1-Infrastructure Operations"
+
+  TF_PLUGIN_CACHE_DIR: "$(Pipeline.Workspace)/.terraform.d/plugin-cache"
+
+stages:
+- stage: tf
+  displayName: Terraform CI/CD
+  jobs:
+  # ---------------- Detect changed folders ----------------
+  - job: detect
+    displayName: Detect iam/s3 changes
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    - script: |
+        set -eo pipefail
+
+        if [ "$(Build.Reason)" = "PullRequest" ] && [ -n "$(System.PullRequest.TargetBranch)" ]; then
+          git fetch origin $(System.PullRequest.TargetBranch):refs/remotes/origin/targetbranch
+          DIFF_RANGE="origin/targetbranch...HEAD"
+        else
+          git rev-parse HEAD~1 >/dev/null 2>&1 && DIFF_RANGE="HEAD~1...HEAD" || DIFF_RANGE="HEAD"
+        fi
+
+        echo "Using diff range: $DIFF_RANGE"
+        CHANGED="$(git diff --name-only $DIFF_RANGE || true)"
+        echo "$CHANGED"
+
+        HAS_IAM=false
+        HAS_S3=false
+        echo "$CHANGED" | grep -E '^iam/' >/dev/null 2>&1 && HAS_IAM=true || true
+        echo "$CHANGED" | grep -E '^s3/'  >/dev/null 2>&1 && HAS_S3=true  || true
+
+        echo "##vso[task.setvariable variable=changedIam;isOutput=true]$HAS_IAM"
+        echo "##vso[task.setvariable variable=changedS3;isOutput=true]$HAS_S3"
+      displayName: Diff and set outputs
+      name: setvars
+
+  # ---------------- Plan (PR) ----------------
+  - job: plan_iam
+    displayName: Plan IAM (PR)
+    dependsOn: detect
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(dependencies.detect.outputs['setvars.changedIam'], 'true'))
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - task: Cache@2
+      displayName: Cache Terraform plugins (iam)
+      inputs:
+        key: 'tf-plugins-iam | "$(Agent.OS)" | iam/.terraform.lock.hcl'
+        path: '$(TF_PLUGIN_CACHE_DIR)'
+        restoreKeys: |
+          tf-plugins-iam | "$(Agent.OS)"
+
+    # Fully-qualified Terraform Installer (Charles Zipp)
+    - task: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
+      displayName: Install Terraform $(tfVersion)
+      inputs:
+        terraformVersion: $(tfVersion)
+
+    # AWS Toolkit AWSShellScript task
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
+      displayName: Terraform plan (iam)
+      inputs:
+        awsCredentials: $(awsServiceConnectionIAM)
+        regionName: $(awsRegion)
+        scriptType: bash
+        inlineScript: |
+          set -eo pipefail
+          export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+          cd iam
+          terraform fmt -check -recursive
+          terraform init -input=false
+          terraform validate -no-color
+          terraform plan -input=false -no-color -out=tfplan
+
+          mkdir -p "$(Build.ArtifactStagingDirectory)/iam"
+          cp tfplan "$(Build.ArtifactStagingDirectory)/iam/"
+
+    - publish: $(Build.ArtifactStagingDirectory)/iam
+      artifact: iam-tfplan
+
+  - job: plan_s3
+    displayName: Plan S3 (PR)
+    dependsOn: detect
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(dependencies.detect.outputs['setvars.changedS3'], 'true'))
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - task: Cache@2
+      displayName: Cache Terraform plugins (s3)
+      inputs:
+        key: 'tf-plugins-s3 | "$(Agent.OS)" | s3/.terraform.lock.hcl'
+        path: '$(TF_PLUGIN_CACHE_DIR)'
+        restoreKeys: |
+          tf-plugins-s3 | "$(Agent.OS)"
+
+    - task: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
+      displayName: Install Terraform $(tfVersion)
+      inputs:
+        terraformVersion: $(tfVersion)
+
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
+      displayName: Terraform plan (s3)
+      inputs:
+        awsCredentials: $(awsServiceConnectionUSE1)
+        regionName: $(awsRegion)
+        scriptType: bash
+        inlineScript: |
+          set -eo pipefail
+          export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+          cd s3
+          terraform fmt -check -recursive
+          terraform init -input=false
+          terraform validate -no-color
+          terraform plan -input=false -no-color -out=tfplan
+
+          mkdir -p "$(Build.ArtifactStagingDirectory)/s3"
+          cp tfplan "$(Build.ArtifactStagingDirectory)/s3/"
+
+    - publish: $(Build.ArtifactStagingDirectory)/s3
+      artifact: s3-tfplan
+
+  # ---------------- Apply (push to main) ----------------
+  - job: apply_iam
+    displayName: Apply IAM (main)
+    dependsOn: detect
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(dependencies.detect.outputs['setvars.changedIam'], 'true'))
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - task: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
+      displayName: Install Terraform $(tfVersion)
+      inputs:
+        terraformVersion: $(tfVersion)
+
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
+      displayName: Terraform apply (iam)
+      inputs:
+        awsCredentials: $(awsServiceConnectionIAM)
+        regionName: $(awsRegion)
+        scriptType: bash
+        inlineScript: |
+          set -eo pipefail
+          export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+          cd iam
+          terraform init -input=false
+          terraform apply -input=false -auto-approve
+
+          SUMMARY="$(System.DefaultWorkingDirectory)/terraform-iam-summary.md"
+          echo "### IAM: Terraform Outputs" > "$SUMMARY"
+          terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$SUMMARY"
+          echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=IAM Terraform Outputs;]$SUMMARY"
+
+  - job: apply_s3
+    displayName: Apply S3 (main)
+    dependsOn: detect
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(dependencies.detect.outputs['setvars.changedS3'], 'true'))
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    - task: charleszipp.azure-pipelines-tasks-terraform.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
+      displayName: Install Terraform $(tfVersion)
+      inputs:
+        terraformVersion: $(tfVersion)
+
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
+      displayName: Terraform apply (s3)
+      inputs:
+        awsCredentials: $(awsServiceConnectionUSE1)
+        regionName: $(awsRegion)
+        scriptType: bash
+        inlineScript: |
+          set -eo pipefail
+          export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+          cd s3
+          terraform init -input=false
+          terraform apply -input=false -auto-approve
+
+          SUMMARY="$(System.DefaultWorkingDirectory)/terraform-s3-summary.md"
+          echo "### S3: Terraform Outputs" > "$SUMMARY"
+          terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$SUMMARY"
+          echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=S3 Terraform Outputs;]$SUMMARY"
