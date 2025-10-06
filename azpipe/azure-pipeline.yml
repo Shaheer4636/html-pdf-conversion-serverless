@@ -1,3 +1,172 @@
-A task is missing. The pipeline references a task called 'AmazonWebServices.aws-vsts-tools.AWSShellScript'. This usually indicates the task isn't installed, and you may be able to install it from the Marketplace: https://marketplace.visualstudio.com. (Task version 1, job 'plan_iam', step ''.)
+# azure-pipelines.yml
+name: terraform-infra
 
-A task is missing. The pipeline references a task called 'AmazonWebServices.aws-vsts-tools.AWSShellScript'. This usually indicates the task isn't installed, and you may be able to install it from the Marketplace: https://marketplace.visualstudio.com. (Task version 1, job 'plan_s3', step ''.)
+trigger:
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - .azure-pipelines/terraform-infra.yml
+
+pr:
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - .azure-pipelines/terraform-infra.yml
+
+variables:
+  tfVersion: "1.13.3"
+  awsRegion: "us-east-1"
+  TF_PLUGIN_CACHE_DIR: "$(Pipeline.Workspace)/.terraform.d/plugin-cache"
+
+stages:
+- stage: tf
+  displayName: Terraform Plan Only
+  jobs:
+  # ---------- Detect changed folders ----------
+  - job: detect
+    displayName: Detect iam/s3 changes
+    pool:
+      vmImage: ubuntu-latest   # change to your self-hosted pool if you have one in AWS
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    - script: |
+        set -eo pipefail
+
+        if [ "$(Build.Reason)" = "PullRequest" ] && [ -n "$(System.PullRequest.TargetBranch)" ]; then
+          git fetch origin $(System.PullRequest.TargetBranch):refs/remotes/origin/targetbranch
+          DIFF_RANGE="origin/targetbranch...HEAD"
+        else
+          git rev-parse HEAD~1 >/dev/null 2>&1 && DIFF_RANGE="HEAD~1...HEAD" || DIFF_RANGE="HEAD"
+        fi
+
+        echo "Using diff range: $DIFF_RANGE"
+        CHANGED="$(git diff --name-only $DIFF_RANGE || true)"
+        echo "$CHANGED"
+
+        HAS_IAM=false
+        HAS_S3=false
+        echo "$CHANGED" | grep -E '^iam/' >/dev/null 2>&1 && HAS_IAM=true || true
+        echo "$CHANGED" | grep -E '^s3/'  >/dev/null 2>&1 && HAS_S3=true  || true
+
+        echo "##vso[task.setvariable variable=changedIam;isOutput=true]$HAS_IAM"
+        echo "##vso[task.setvariable variable=changedS3;isOutput=true]$HAS_S3"
+      displayName: Diff and set outputs
+      name: setvars
+
+  # ---------- PLAN IAM ----------
+  - job: plan_iam
+    displayName: Plan IAM
+    dependsOn: detect
+    condition: and(succeeded(), eq(dependencies.detect.outputs['setvars.changedIam'], 'true'))
+    pool:
+      vmImage: ubuntu-latest   # change to your self-hosted AWS agent pool if available
+    steps:
+    - checkout: self
+
+    - task: Cache@2
+      displayName: Cache Terraform plugins (iam)
+      inputs:
+        key: 'tf-plugins-iam | "$(Agent.OS)" | iam/.terraform.lock.hcl'
+        path: '$(TF_PLUGIN_CACHE_DIR)'
+        restoreKeys: |
+          tf-plugins-iam | "$(Agent.OS)"
+
+    - script: |
+        set -eo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y unzip
+        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
+
+        # Install Terraform
+        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
+        sudo unzip -o tf.zip -d /usr/local/bin
+        rm tf.zip
+        terraform -version
+
+        # Prefer provided AWS_* vars if present; otherwise rely on default chain (IMDS/credential file)
+        export AWS_DEFAULT_REGION="${awsRegion}"
+
+        # Simple sanity check: try to get caller identity if aws cli exists; otherwise skip
+        if command -v aws >/dev/null 2>&1; then
+          aws sts get-caller-identity || echo "No AWS CLI or credentials available yet; continuing so Terraform provider can resolve via its chain."
+        fi
+
+        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+        cd iam
+        terraform fmt -check -recursive
+        terraform init -input=false
+        terraform validate -no-color
+        terraform plan -input=false -no-color -out=tfplan || { echo "Plan failed. Ensure credentials via EC2 role or AWS_* env vars."; exit 1; }
+        terraform show -no-color tfplan > tfplan.txt
+
+        mkdir -p "$(Build.ArtifactStagingDirectory)/iam"
+        cp tfplan tfplan.txt "$(Build.ArtifactStagingDirectory)/iam/"
+
+        echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=IAM Terraform Plan;]$(Build.ArtifactStagingDirectory)/iam/tfplan.txt"
+      displayName: Terraform plan (iam)
+
+    - publish: $(Build.ArtifactStagingDirectory)/iam
+      artifact: iam-tfplan
+
+  # ---------- PLAN S3 ----------
+  - job: plan_s3
+    displayName: Plan S3
+    dependsOn: detect
+    condition: and(succeeded(), eq(dependencies.detect.outputs['setvars.changedS3'], 'true'))
+    pool:
+      vmImage: ubuntu-latest   # change to your self-hosted AWS agent pool if available
+    steps:
+    - checkout: self
+
+    - task: Cache@2
+      displayName: Cache Terraform plugins (s3)
+      inputs:
+        key: 'tf-plugins-s3 | "$(Agent.OS)" | s3/.terraform.lock.hcl'
+        path: '$(TF_PLUGIN_CACHE_DIR)'
+        restoreKeys: |
+          tf-plugins-s3 | "$(Agent.OS)"
+
+    - script: |
+        set -eo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y unzip
+        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
+
+        # Install Terraform
+        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
+        sudo unzip -o tf.zip -d /usr/local/bin
+        rm tf.zip
+        terraform -version
+
+        export AWS_DEFAULT_REGION="${awsRegion}"
+
+        if command -v aws >/dev/null 2>&1; then
+          aws sts get-caller-identity || echo "No AWS CLI or credentials available yet; continuing so Terraform provider can resolve via its chain."
+        fi
+
+        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+        cd s3
+        terraform fmt -check -recursive
+        terraform init -input=false
+        terraform validate -no-color
+        terraform plan -input=false -no-color -out=tfplan || { echo "Plan failed. Ensure credentials via EC2 role or AWS_* env vars."; exit 1; }
+        terraform show -no-color tfplan > tfplan.txt
+
+        mkdir -p "$(Build.ArtifactStagingDirectory)/s3"
+        cp tfplan tfplan.txt "$(Build.ArtifactStagingDirectory)/s3/"
+
+        echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=S3 Terraform Plan;]$(Build.ArtifactStagingDirectory)/s3/tfplan.txt"
+      displayName: Terraform plan (s3)
+
+    - publish: $(Build.ArtifactStagingDirectory)/s3
+      artifact: s3-tfplan
