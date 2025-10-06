@@ -7,19 +7,7 @@ trigger:
   paths:
     include:
       - iam/**
-      - s3/**
-      - azure-pipelines.yml
-      - .azure-pipelines/terraform-infra.yml
 
-pr:
-  branches:
-    include: [ main ]
-  paths:
-    include:
-      - iam/**
-      - s3/**
-      - azure-pipelines.yml
-      - .azure-pipelines/terraform-infra.yml
 
 variables:
   tfVersion: "1.13.3"
