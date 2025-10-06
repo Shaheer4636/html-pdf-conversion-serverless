@@ -7,20 +7,37 @@ trigger:
   paths:
     include:
       - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - azure-pipeline.yml           # include both spellings just in case
+      - .azure-pipelines/terraform-infra.yml
 
+pr:
+  branches:
+    include: [ main ]
+  paths:
+    include:
+      - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - azure-pipeline.yml
+      - .azure-pipelines/terraform-infra.yml
 
 variables:
   tfVersion: "1.13.3"
   awsRegion: "us-east-1"
   TF_IN_AUTOMATION: "true"
+  # queue-time knobs (optional):
+  runAll: ""     # set to "true" to force both
+  only:   ""     # set to "iam" or "s3" to run one
 
 stages:
 - stage: tf
   displayName: Terraform Plan Only
   jobs:
-  # ---------- Detect changed folders ----------
+  # ---------- Detect changed folders / decide what to run ----------
   - job: detect
-    displayName: Detect iam/s3 changes
+    displayName: Decide targets (iam/s3)
     pool:
       vmImage: ubuntu-latest
     steps:
@@ -30,26 +47,54 @@ stages:
     - script: |
         set -eo pipefail
 
-        if [ "$(Build.Reason)" = "PullRequest" ] && [ -n "$(System.PullRequest.TargetBranch)" ]; then
-          git fetch origin $(System.PullRequest.TargetBranch):refs/remotes/origin/targetbranch
-          DIFF_RANGE="origin/targetbranch...HEAD"
-        else
-          git rev-parse HEAD~1 >/dev/null 2>&1 && DIFF_RANGE="HEAD~1...HEAD" || DIFF_RANGE="HEAD"
-        fi
+        # Pick up optional overrides from variables
+        RUN_ALL="${RUN_ALL:-${runAll:-}}"
+        ONLY="${ONLY:-${only:-}}"
 
-        echo "Using diff range: $DIFF_RANGE"
-        CHANGED="$(git diff --name-only $DIFF_RANGE || true)"
-        echo "$CHANGED"
+        # If manual run, default to run all
+        if [ "$(Build.Reason)" = "Manual" ] && [ -z "$RUN_ALL" ] && [ -z "$ONLY" ]; then
+          RUN_ALL="true"
+        fi
 
         HAS_IAM=false
         HAS_S3=false
-        echo "$CHANGED" | grep -E '^iam/' >/dev/null 2>&1 && HAS_IAM=true || true
-        echo "$CHANGED" | grep -E '^s3/'  >/dev/null 2>&1 && HAS_S3=true  || true
+
+        if [ "$RUN_ALL" = "true" ]; then
+          HAS_IAM=true; HAS_S3=true
+        elif [ "$ONLY" = "iam" ]; then
+          HAS_IAM=true
+        elif [ "$ONLY" = "s3" ]; then
+          HAS_S3=true
+        else
+          # Diff-based detection
+          if [ "$(Build.Reason)" = "PullRequest" ] && [ -n "$(System.PullRequest.TargetBranch)" ]; then
+            git fetch origin $(System.PullRequest.TargetBranch):refs/remotes/origin/targetbranch
+            DIFF_RANGE="origin/targetbranch...HEAD"
+          else
+            git rev-parse HEAD~1 >/dev/null 2>&1 && DIFF_RANGE="HEAD~1...HEAD" || DIFF_RANGE="HEAD"
+          fi
+
+          echo "Using diff range: $DIFF_RANGE"
+          CHANGED="$(git diff --name-only $DIFF_RANGE || true)"
+          echo "$CHANGED"
+
+          # If first run (no diff) or nothing changed, default to run all so you don't get skipped
+          if [ "$DIFF_RANGE" = "HEAD" ] || [ -z "$CHANGED" ]; then
+            HAS_IAM=true; HAS_S3=true
+          else
+            echo "$CHANGED" | grep -E '^iam/' >/dev/null 2>&1 && HAS_IAM=true || true
+            echo "$CHANGED" | grep -E '^s3/'  >/dev/null 2>&1 && HAS_S3=true  || true
+          fi
+        fi
 
         echo "##vso[task.setvariable variable=changedIam;isOutput=true]$HAS_IAM"
         echo "##vso[task.setvariable variable=changedS3;isOutput=true]$HAS_S3"
-      displayName: Diff and set outputs
+        echo "Decisions -> IAM: $HAS_IAM, S3: $HAS_S3"
+      displayName: Decide (respect manual/overrides)
       name: setvars
+      env:
+        RUN_ALL: $(runAll)
+        ONLY: $(only)
 
   # ---------- PLAN IAM ----------
   - job: plan_iam
@@ -72,8 +117,7 @@ stages:
         rm tf.zip
         terraform -version
 
-        # Region only; credentials must come from your agent (instance profile or env vars)
-        export AWS_DEFAULT_REGION="us-east-1"
+        export AWS_DEFAULT_REGION="$(awsRegion)"
 
         cd iam
         terraform fmt -check -recursive
@@ -112,7 +156,7 @@ stages:
         rm tf.zip
         terraform -version
 
-        export AWS_DEFAULT_REGION="us-east-1"
+        export AWS_DEFAULT_REGION="$(awsRegion)"
 
         cd s3
         terraform fmt -check -recursive
