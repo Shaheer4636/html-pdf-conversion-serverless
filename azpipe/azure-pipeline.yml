@@ -7,24 +7,12 @@ trigger:
   paths:
     include:
       - iam/**
-      - s3/**
-      - azure-pipelines.yml
-      - .azure-pipelines/terraform-infra.yml
 
-pr:
-  branches:
-    include: [ main ]
-  paths:
-    include:
-      - iam/**
-      - s3/**
-      - azure-pipelines.yml
-      - .azure-pipelines/terraform-infra.yml
 
 variables:
   tfVersion: "1.13.3"
   awsRegion: "us-east-1"
-  TF_PLUGIN_CACHE_DIR: "$(Pipeline.Workspace)/.terraform.d/plugin-cache"
+  TF_IN_AUTOMATION: "true"
 
 stages:
 - stage: tf
@@ -34,7 +22,7 @@ stages:
   - job: detect
     displayName: Detect iam/s3 changes
     pool:
-      vmImage: ubuntu-latest   # change to your self-hosted pool if you have one in AWS
+      vmImage: ubuntu-latest
     steps:
     - checkout: self
       fetchDepth: 0
@@ -69,23 +57,14 @@ stages:
     dependsOn: detect
     condition: and(succeeded(), eq(dependencies.detect.outputs['setvars.changedIam'], 'true'))
     pool:
-      vmImage: ubuntu-latest   # change to your self-hosted AWS agent pool if available
+      vmImage: ubuntu-latest
     steps:
     - checkout: self
-
-    - task: Cache@2
-      displayName: Cache Terraform plugins (iam)
-      inputs:
-        key: 'tf-plugins-iam | "$(Agent.OS)" | iam/.terraform.lock.hcl'
-        path: '$(TF_PLUGIN_CACHE_DIR)'
-        restoreKeys: |
-          tf-plugins-iam | "$(Agent.OS)"
 
     - script: |
         set -eo pipefail
         sudo apt-get update -y
         sudo apt-get install -y unzip
-        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
 
         # Install Terraform
         curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
@@ -93,20 +72,14 @@ stages:
         rm tf.zip
         terraform -version
 
-        # Prefer provided AWS_* vars if present; otherwise rely on default chain (IMDS/credential file)
-        export AWS_DEFAULT_REGION="${awsRegion}"
+        # Region only; credentials must come from your agent (instance profile or env vars)
+        export AWS_DEFAULT_REGION="us-east-1"
 
-        # Simple sanity check: try to get caller identity if aws cli exists; otherwise skip
-        if command -v aws >/dev/null 2>&1; then
-          aws sts get-caller-identity || echo "No AWS CLI or credentials available yet; continuing so Terraform provider can resolve via its chain."
-        fi
-
-        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
         cd iam
         terraform fmt -check -recursive
         terraform init -input=false
         terraform validate -no-color
-        terraform plan -input=false -no-color -out=tfplan || { echo "Plan failed. Ensure credentials via EC2 role or AWS_* env vars."; exit 1; }
+        terraform plan -input=false -no-color -out=tfplan
         terraform show -no-color tfplan > tfplan.txt
 
         mkdir -p "$(Build.ArtifactStagingDirectory)/iam"
@@ -124,23 +97,14 @@ stages:
     dependsOn: detect
     condition: and(succeeded(), eq(dependencies.detect.outputs['setvars.changedS3'], 'true'))
     pool:
-      vmImage: ubuntu-latest   # change to your self-hosted AWS agent pool if available
+      vmImage: ubuntu-latest
     steps:
     - checkout: self
-
-    - task: Cache@2
-      displayName: Cache Terraform plugins (s3)
-      inputs:
-        key: 'tf-plugins-s3 | "$(Agent.OS)" | s3/.terraform.lock.hcl'
-        path: '$(TF_PLUGIN_CACHE_DIR)'
-        restoreKeys: |
-          tf-plugins-s3 | "$(Agent.OS)"
 
     - script: |
         set -eo pipefail
         sudo apt-get update -y
         sudo apt-get install -y unzip
-        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
 
         # Install Terraform
         curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
@@ -148,18 +112,13 @@ stages:
         rm tf.zip
         terraform -version
 
-        export AWS_DEFAULT_REGION="${awsRegion}"
+        export AWS_DEFAULT_REGION="us-east-1"
 
-        if command -v aws >/dev/null 2>&1; then
-          aws sts get-caller-identity || echo "No AWS CLI or credentials available yet; continuing so Terraform provider can resolve via its chain."
-        fi
-
-        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
         cd s3
         terraform fmt -check -recursive
         terraform init -input=false
         terraform validate -no-color
-        terraform plan -input=false -no-color -out=tfplan || { echo "Plan failed. Ensure credentials via EC2 role or AWS_* env vars."; exit 1; }
+        terraform plan -input=false -no-color -out=tfplan
         terraform show -no-color tfplan > tfplan.txt
 
         mkdir -p "$(Build.ArtifactStagingDirectory)/s3"
