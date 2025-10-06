@@ -7,25 +7,13 @@ trigger:
   paths:
     include:
       - iam/**
-      - s3/**
-      - azure-pipelines.yml
-      - .azure-pipelines/terraform-infra.yml
 
-pr:
-  branches:
-    include: [ main ]
-  paths:
-    include:
-      - iam/**
-      - s3/**
-      - azure-pipelines.yml
-      - .azure-pipelines/terraform-infra.yml
 
 variables:
   tfVersion: "1.13.3"
   awsRegion: "us-east-1"
 
-  # Service connections provided by you
+  # Service connections you provided
   tfServiceConnection: "SAMCObservability-492046385895-DEVOPSIACSCVPC-us-east-1-Infrastructure Operations"
   awsServiceConnection: "SAMCObservability-492046385895-DEVOPSIACSCVPC-Infrastructure Operations"
 
@@ -52,7 +40,7 @@ stages:
           git fetch origin $(System.PullRequest.TargetBranch):refs/remotes/origin/targetbranch
           DIFF_RANGE="origin/targetbranch...HEAD"
         else
-          # Fallback for CI on main (handles initial run too)
+          # For CI on main
           git rev-parse HEAD~1 >/dev/null 2>&1 && DIFF_RANGE="HEAD~1...HEAD" || DIFF_RANGE="HEAD"
         fi
 
@@ -93,12 +81,14 @@ stages:
         restoreKeys: |
           tf-plugins-iam | "$(Agent.OS)"
 
-    - task: TerraformInstaller@1
+    # Fully qualified Terraform Installer (Charles Zipp extension)
+    - task: charleszipp.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
       displayName: Install Terraform $(tfVersion)
       inputs:
         terraformVersion: $(tfVersion)
 
-    - task: AWSShellScript@1
+    # Fully qualified AWS Shell Script task
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
       displayName: Terraform plan (iam)
       inputs:
         awsCredentials: $(awsServiceConnection)
@@ -115,8 +105,8 @@ stages:
           terraform validate -no-color
           terraform plan -input=false -no-color -out=tfplan
 
-          mkdir -p $(Build.ArtifactStagingDirectory)/iam
-          cp tfplan $(Build.ArtifactStagingDirectory)/iam/
+          mkdir -p "$(Build.ArtifactStagingDirectory)/iam"
+          cp tfplan "$(Build.ArtifactStagingDirectory)/iam/"
 
     - publish: $(Build.ArtifactStagingDirectory)/iam
       artifact: iam-tfplan
@@ -138,12 +128,12 @@ stages:
         restoreKeys: |
           tf-plugins-s3 | "$(Agent.OS)"
 
-    - task: TerraformInstaller@1
+    - task: charleszipp.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
       displayName: Install Terraform $(tfVersion)
       inputs:
         terraformVersion: $(tfVersion)
 
-    - task: AWSShellScript@1
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
       displayName: Terraform plan (s3)
       inputs:
         awsCredentials: $(awsServiceConnection)
@@ -160,8 +150,8 @@ stages:
           terraform validate -no-color
           terraform plan -input=false -no-color -out=tfplan
 
-          mkdir -p $(Build.ArtifactStagingDirectory)/s3
-          cp tfplan $(Build.ArtifactStagingDirectory)/s3/
+          mkdir -p "$(Build.ArtifactStagingDirectory)/s3"
+          cp tfplan "$(Build.ArtifactStagingDirectory)/s3/"
 
     - publish: $(Build.ArtifactStagingDirectory)/s3
       artifact: s3-tfplan
@@ -185,12 +175,12 @@ stages:
     steps:
     - checkout: self
 
-    - task: TerraformInstaller@1
+    - task: charleszipp.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
       displayName: Install Terraform $(tfVersion)
       inputs:
         terraformVersion: $(tfVersion)
 
-    - task: AWSShellScript@1
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
       displayName: Terraform apply (iam)
       inputs:
         awsCredentials: $(awsServiceConnection)
@@ -209,7 +199,6 @@ stages:
           echo "### IAM: Terraform Outputs" > "$SUMMARY"
           terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$SUMMARY"
 
-          # Attach to Azure Pipelines Job Summary
           echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=IAM Terraform Outputs;]$SUMMARY"
 
   # ----- S3 apply -----
@@ -221,12 +210,12 @@ stages:
     steps:
     - checkout: self
 
-    - task: TerraformInstaller@1
+    - task: charleszipp.azure-pipelines-tasks-terraform-installer.TerraformInstaller@1
       displayName: Install Terraform $(tfVersion)
       inputs:
         terraformVersion: $(tfVersion)
 
-    - task: AWSShellScript@1
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
       displayName: Terraform apply (s3)
       inputs:
         awsCredentials: $(awsServiceConnection)
@@ -245,5 +234,4 @@ stages:
           echo "### S3: Terraform Outputs" > "$SUMMARY"
           terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$SUMMARY"
 
-          # Attach to Azure Pipelines Job Summary
           echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=S3 Terraform Outputs;]$SUMMARY"
