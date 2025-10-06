@@ -1,4 +1,8 @@
 # azure-pipelines.yml
+# NOTE: Uses AWS Toolkit for Azure DevOps task:
+#       AmazonWebServices.aws-vsts-tools.AWSShellScript@1
+#       Make sure the extension is installed in your org.
+
 name: terraform-infra
 
 trigger:
@@ -26,9 +30,13 @@ variables:
   awsRegion: "us-east-1"
   TF_PLUGIN_CACHE_DIR: "$(Pipeline.Workspace)/.terraform.d/plugin-cache"
 
+  # EXACT service connection display names you provided
+  awsServiceConnectionIAM:  "SAMCObservability-492046385895-DEVOPSIACSVCVPC-Infrastructure Operations"
+  awsServiceConnectionUSE1: "SAMCObservability-492046385895-DEVOPSIACSVCVPC-us-east-1-Infrastructure Operations"
+
 stages:
 - stage: tf
-  displayName: Terraform CI/CD
+  displayName: Terraform Plan Only
   jobs:
   # ---------- Detect changed folders ----------
   - job: detect
@@ -63,11 +71,11 @@ stages:
       displayName: Diff and set outputs
       name: setvars
 
-  # ---------- PLAN (PR) ----------
+  # ---------- PLAN (runs on PRs and pushes; never applies) ----------
   - job: plan_iam
-    displayName: Plan IAM (PR)
+    displayName: Plan IAM
     dependsOn: detect
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(dependencies.detect.outputs['setvars.changedIam'], 'true'))
+    condition: and(succeeded(), eq(dependencies.detect.outputs['setvars.changedIam'], 'true'))
     pool:
       vmImage: ubuntu-latest
     steps:
@@ -81,45 +89,47 @@ stages:
         restoreKeys: |
           tf-plugins-iam | "$(Agent.OS)"
 
-    - script: |
-        set -eo pipefail
-        sudo apt-get update -y
-        sudo apt-get install -y unzip jq
-        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
-
-        # Install Terraform $(tfVersion) without marketplace tasks
-        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
-        sudo unzip -o tf.zip -d /usr/local/bin
-        rm tf.zip
-        terraform -version
-
-        # Export AWS creds: prefer IAM-specific, then fallback to generic
-        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID_IAM:-${AWS_ACCESS_KEY_ID:-}}"
-        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY_IAM:-${AWS_SECRET_ACCESS_KEY:-}}"
-        export AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN_IAM:-${AWS_SESSION_TOKEN:-}}"
-        export AWS_DEFAULT_REGION="${awsRegion}"
-
-        [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "ERROR: Missing AWS_ACCESS_KEY_ID(_IAM)"; exit 1; }
-        [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "ERROR: Missing AWS_SECRET_ACCESS_KEY(_IAM)"; exit 1; }
-
-        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
-        cd iam
-        terraform fmt -check -recursive
-        terraform init -input=false
-        terraform validate -no-color
-        terraform plan -input=false -no-color -out=tfplan
-
-        mkdir -p "$(Build.ArtifactStagingDirectory)/iam"
-        cp tfplan "$(Build.ArtifactStagingDirectory)/iam/"
+    # Use AWS service connection to inject creds into the script
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
       displayName: Terraform plan (iam)
+      inputs:
+        awsCredentials: $(awsServiceConnectionIAM)
+        regionName: $(awsRegion)
+        scriptType: bash
+        inlineScript: |
+          set -eo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y unzip
+
+          # Install Terraform $(tfVersion)
+          curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
+          sudo unzip -o tf.zip -d /usr/local/bin
+          rm tf.zip
+          terraform -version
+
+          export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+          cd iam
+          terraform fmt -check -recursive
+          terraform init -input=false
+          terraform validate -no-color
+          terraform plan -input=false -no-color -out=tfplan
+          terraform show -no-color tfplan > tfplan.txt
+
+          mkdir -p "$(Build.ArtifactStagingDirectory)/iam"
+          cp tfplan tfplan.txt "$(Build.ArtifactStagingDirectory)/iam/"
+
+          # Attach summary to job
+          echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=IAM Terraform Plan;]$(Build.ArtifactStagingDirectory)/iam/tfplan.txt"
 
     - publish: $(Build.ArtifactStagingDirectory)/iam
       artifact: iam-tfplan
 
   - job: plan_s3
-    displayName: Plan S3 (PR)
+    displayName: Plan S3
     dependsOn: detect
-    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(dependencies.detect.outputs['setvars.changedS3'], 'true'))
+    condition: and(succeeded(), eq(dependencies.detect.outputs['setvars.changedS3'], 'true'))
     pool:
       vmImage: ubuntu-latest
     steps:
@@ -133,115 +143,38 @@ stages:
         restoreKeys: |
           tf-plugins-s3 | "$(Agent.OS)"
 
-    - script: |
-        set -eo pipefail
-        sudo apt-get update -y
-        sudo apt-get install -y unzip jq
-        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
-
-        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
-        sudo unzip -o tf.zip -d /usr/local/bin
-        rm tf.zip
-        terraform -version
-
-        # Export AWS creds: prefer USE1-specific, then fallback to generic
-        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID_USE1:-${AWS_ACCESS_KEY_ID:-}}"
-        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY_USE1:-${AWS_SECRET_ACCESS_KEY:-}}"
-        export AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN_USE1:-${AWS_SESSION_TOKEN:-}}"
-        export AWS_DEFAULT_REGION="${awsRegion}"
-
-        [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "ERROR: Missing AWS_ACCESS_KEY_ID(_USE1)"; exit 1; }
-        [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "ERROR: Missing AWS_SECRET_ACCESS_KEY(_USE1)"; exit 1; }
-
-        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
-        cd s3
-        terraform fmt -check -recursive
-        terraform init -input=false
-        terraform validate -no-color
-        terraform plan -input=false -no-color -out=tfplan
-
-        mkdir -p "$(Build.ArtifactStagingDirectory)/s3"
-        cp tfplan "$(Build.ArtifactStagingDirectory)/s3/"
+    - task: AmazonWebServices.aws-vsts-tools.AWSShellScript@1
       displayName: Terraform plan (s3)
+      inputs:
+        awsCredentials: $(awsServiceConnectionUSE1)
+        regionName: $(awsRegion)
+        scriptType: bash
+        inlineScript: |
+          set -eo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y unzip
+
+          # Install Terraform $(tfVersion)
+          curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
+          sudo unzip -o tf.zip -d /usr/local/bin
+          rm tf.zip
+          terraform -version
+
+          export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+          cd s3
+          terraform fmt -check -recursive
+          terraform init -input=false
+          terraform validate -no-color
+          terraform plan -input=false -no-color -out=tfplan
+          terraform show -no-color tfplan > tfplan.txt
+
+          mkdir -p "$(Build.ArtifactStagingDirectory)/s3"
+          cp tfplan tfplan.txt "$(Build.ArtifactStagingDirectory)/s3/"
+
+          # Attach summary to job
+          echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=S3 Terraform Plan;]$(Build.ArtifactStagingDirectory)/s3/tfplan.txt"
 
     - publish: $(Build.ArtifactStagingDirectory)/s3
       artifact: s3-tfplan
-
-  # ---------- APPLY (push to main) ----------
-  - job: apply_iam
-    displayName: Apply IAM (main)
-    dependsOn: detect
-    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(dependencies.detect.outputs['setvars.changedIam'], 'true'))
-    pool:
-      vmImage: ubuntu-latest
-    steps:
-    - checkout: self
-
-    - script: |
-        set -eo pipefail
-        sudo apt-get update -y
-        sudo apt-get install -y unzip jq
-        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
-
-        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
-        sudo unzip -o tf.zip -d /usr/local/bin
-        rm tf.zip
-        terraform -version
-
-        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID_IAM:-${AWS_ACCESS_KEY_ID:-}}"
-        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY_IAM:-${AWS_SECRET_ACCESS_KEY:-}}"
-        export AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN_IAM:-${AWS_SESSION_TOKEN:-}}"
-        export AWS_DEFAULT_REGION="${awsRegion}"
-
-        [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "ERROR: Missing AWS_ACCESS_KEY_ID(_IAM)"; exit 1; }
-        [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "ERROR: Missing AWS_SECRET_ACCESS_KEY(_IAM)"; exit 1; }
-
-        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
-        cd iam
-        terraform init -input=false
-        terraform apply -input=false -auto-approve
-
-        SUMMARY="$(System.DefaultWorkingDirectory)/terraform-iam-summary.md"
-        echo "### IAM: Terraform Outputs" > "$SUMMARY"
-        terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$SUMMARY"
-        echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=IAM Terraform Outputs;]$SUMMARY"
-      displayName: Terraform apply (iam)
-
-  - job: apply_s3
-    displayName: Apply S3 (main)
-    dependsOn: detect
-    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(dependencies.detect.outputs['setvars.changedS3'], 'true'))
-    pool:
-      vmImage: ubuntu-latest
-    steps:
-    - checkout: self
-
-    - script: |
-        set -eo pipefail
-        sudo apt-get update -y
-        sudo apt-get install -y unzip jq
-        mkdir -p "$(TF_PLUGIN_CACHE_DIR)"
-
-        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
-        sudo unzip -o tf.zip -d /usr/local/bin
-        rm tf.zip
-        terraform -version
-
-        export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID_USE1:-${AWS_ACCESS_KEY_ID:-}}"
-        export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY_USE1:-${AWS_SECRET_ACCESS_KEY:-}}"
-        export AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN_USE1:-${AWS_SESSION_TOKEN:-}}"
-        export AWS_DEFAULT_REGION="${awsRegion}"
-
-        [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "ERROR: Missing AWS_ACCESS_KEY_ID(_USE1)"; exit 1; }
-        [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "ERROR: Missing AWS_SECRET_ACCESS_KEY(_USE1)"; exit 1; }
-
-        export TF_PLUGIN_CACHE_DIR="$(TF_PLUGIN_CACHE_DIR)"
-        cd s3
-        terraform init -input=false
-        terraform apply -input=false -auto-approve
-
-        SUMMARY="$(System.DefaultWorkingDirectory)/terraform-s3-summary.md"
-        echo "### S3: Terraform Outputs" > "$SUMMARY"
-        terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: \(.value.value)"' >> "$SUMMARY"
-        echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=S3 Terraform Outputs;]$SUMMARY"
-      displayName: Terraform apply (s3)
