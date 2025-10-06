@@ -1,40 +1,216 @@
-Get:19 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse Translation-en [6116 B]
-Get:20 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 Components [940 B]
-Get:21 http://azure.archive.ubuntu.com/ubuntu noble-backports/main amd64 Components [7160 B]
-Get:22 http://azure.archive.ubuntu.com/ubuntu noble-backports/universe amd64 Components [11.0 kB]
+# azure-pipelines.yml
+name: terraform-infra
 
+trigger:
+  branches: [ main ]
+  paths:
+    include:
+      - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - azure-pipeline.yml
+      - .azure-pipelines/terraform-infra.yml
 
+pr:
+  branches: [ main ]
+  paths:
+    include:
+      - iam/**
+      - s3/**
+      - azure-pipelines.yml
+      - azure-pipeline.yml
+      - .azure-pipelines/terraform-infra.yml
 
-Starting: Terraform plan (s3)
-==============================================================================
-Task         : Command line
-Description  : Run a command line script using Bash on Linux and macOS and cmd.exe on Windows
-Version      : 2.250.1
-Author       : Microsoft Corporation
-Help         : https://docs.microsoft.com/azure/devops/pipelines/tasks/utility/command-line
-==============================================================================
-Generating script.
-========================== Starting Command Output ===========================
-/usr/bin/bash --noprofile --norc /home/vsts/work/_temp/94eaf98b-b598-4f84-b993-238ae288e183.sh
-Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
-Hit:6 https://packages.microsoft.com/repos/azure-cli noble InRelease
-Hit:2 http://azure.archive.ubuntu.com/ubuntu noble InRelease
-Get:7 https://packages.microsoft.com/ubuntu/24.04/prod noble InRelease [3600 B]
-Get:3 http://azure.archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]
-Get:4 http://azure.archive.ubuntu.com/ubuntu noble-backports InRelease [126 kB]
-Get:5 http://azure.archive.ubuntu.com/ubuntu noble-security InRelease [126 kB]
-Get:8 https://packages.microsoft.com/ubuntu/24.04/prod noble/main armhf Packages [10.5 kB]
-Get:9 https://packages.microsoft.com/ubuntu/24.04/prod noble/main amd64 Packages [59.5 kB]
-Get:10 https://packages.microsoft.com/ubuntu/24.04/prod noble/main arm64 Packages [42.5 kB]
-Get:11 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages [1483 kB]
-Get:12 http://azure.archive.ubuntu.com/ubuntu noble-updates/main Translation-en [286 kB]
-Get:13 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Components [175 kB]
-Get:14 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 c-n-f Metadata [15.3 kB]
-Get:15 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Packages [1486 kB]
-Get:16 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe Translation-en [300 kB]
-Get:17 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Components [378 kB]
-Get:18 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 c-n-f Metadata [31.1 kB]
-Get:19 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Packages [2053 kB]
-Get:20 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted Translation-en [463 kB]
-Get:21 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Components [212 B]
-Get:22 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse Translation-en [6116 B]
+variables:
+  tfVersion: "1.13.3"
+  awsRegion: "us-east-1"
+  TF_IN_AUTOMATION: "true"
+  # queue-time toggles you can set when you click "Run pipeline"
+  runAll: ""      # set "true" to run both regardless of diff
+  only:   ""      # set "iam" or "s3" to run just one
+
+stages:
+- stage: tf
+  displayName: Terraform Plan Only
+  jobs:
+  # ---------------- Decide targets ----------------
+  - job: decide
+    displayName: Decide targets (iam/s3)
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+      fetchDepth: 0
+
+    - script: |
+        set -euo pipefail
+
+        RUN_ALL="${RUN_ALL:-${runAll:-}}"
+        ONLY="${ONLY:-${only:-}}"
+
+        HAS_IAM=false
+        HAS_S3=false
+
+        # Manual run default: run both
+        if [ "$(Build.Reason)" = "Manual" ] && [ -z "$RUN_ALL" ] && [ -z "$ONLY" ]; then
+          RUN_ALL="true"
+        fi
+
+        if [ "$RUN_ALL" = "true" ]; then
+          HAS_IAM=true; HAS_S3=true
+        elif [ "$ONLY" = "iam" ]; then
+          HAS_IAM=true
+        elif [ "$ONLY" = "s3" ]; then
+          HAS_S3=true
+        else
+          # Diff-based detection
+          if [ "$(Build.Reason)" = "PullRequest" ] && [ -n "$(System.PullRequest.TargetBranch)" ]; then
+            git fetch origin $(System.PullRequest.TargetBranch):refs/remotes/origin/targetbranch
+            DIFF_RANGE="origin/targetbranch...HEAD"
+          else
+            git rev-parse HEAD~1 >/dev/null 2>&1 && DIFF_RANGE="HEAD~1...HEAD" || DIFF_RANGE="HEAD"
+          fi
+
+          echo "Using diff range: $DIFF_RANGE"
+          CHANGED="$(git diff --name-only $DIFF_RANGE || true)"
+          echo "$CHANGED"
+
+          # If first run or nothing changed, run both to avoid confusing "skipped"
+          if [ "$DIFF_RANGE" = "HEAD" ] || [ -z "$CHANGED" ]; then
+            HAS_IAM=true; HAS_S3=true
+          else
+            echo "$CHANGED" | grep -E '^iam/' >/dev/null 2>&1 && HAS_IAM=true || true
+            echo "$CHANGED" | grep -E '^s3/'  >/dev/null 2>&1 && HAS_S3=true  || true
+          fi
+        fi
+
+        # If directories are missing, turn off the target
+        [ -d iam ] || HAS_IAM=false
+        [ -d s3  ] || HAS_S3=false
+
+        echo "##vso[task.setvariable variable=runIam;isOutput=true]$HAS_IAM"
+        echo "##vso[task.setvariable variable=runS3;isOutput=true]$HAS_S3"
+        echo "Decision -> IAM=$HAS_IAM  S3=$HAS_S3"
+      displayName: Decide targets
+      name: out
+      env:
+        RUN_ALL: $(runAll)
+        ONLY: $(only)
+
+  # ---------------- Plan IAM ----------------
+  - job: plan_iam
+    displayName: Plan IAM
+    dependsOn: decide
+    condition: and(succeeded(), eq(dependencies.decide.outputs['out.runIam'], 'true'))
+    pool:
+      vmImage: ubuntu-latest   # if you have a self-hosted EC2 agent pool, put its name here
+    steps:
+    - checkout: self
+
+    - script: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y curl unzip jq
+
+        # Install Terraform
+        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
+        sudo unzip -o tf.zip -d /usr/local/bin
+        rm tf.zip
+        terraform -version
+
+        # Fail fast if there are no *.tf files
+        if [ ! -d iam ] || ! ls iam/*.tf >/dev/null 2>&1; then
+          echo "No Terraform files under iam/. Skipping."
+          exit 0
+        fi
+
+        # Fail fast if there are no credentials reachable for AWS
+        export AWS_DEFAULT_REGION="$(awsRegion)"
+        # OK if: AWS_ACCESS_KEY_ID is set OR web-identity envs are set OR EC2/ECS metadata responds
+        HAVE_CREDS="no"
+        if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+          HAVE_CREDS="yes"
+        elif [ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ]; then
+          HAVE_CREDS="yes"
+        elif curl -fsS --max-time 1 http://169.254.169.254/latest/meta-data/iam/security-credentials/ >/dev/null 2>&1; then
+          HAVE_CREDS="yes"
+        fi
+        if [ "$HAVE_CREDS" != "yes" ]; then
+          echo "ERROR: No AWS credentials available for Terraform."
+          echo "Fix by EITHER: (1) run on a self-hosted EC2 agent with an IAM role, (2) set AWS_* variables in the pipeline, or (3) install AWS Toolkit and use a service connection."
+          exit 1
+        fi
+
+        cd iam
+        terraform fmt -check -recursive
+        terraform init -input=false
+        terraform validate -no-color
+        terraform plan -input=false -no-color -out=tfplan
+        terraform show -no-color tfplan > tfplan.txt
+
+        mkdir -p "$(Build.ArtifactStagingDirectory)/iam"
+        cp tfplan tfplan.txt "$(Build.ArtifactStagingDirectory)/iam/"
+
+        echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=IAM Terraform Plan;]$(Build.ArtifactStagingDirectory)/iam/tfplan.txt"
+      displayName: Terraform plan (iam)
+
+    - publish: $(Build.ArtifactStagingDirectory)/iam
+      artifact: iam-tfplan
+
+  # ---------------- Plan S3 ----------------
+  - job: plan_s3
+    displayName: Plan S3
+    dependsOn: decide
+    condition: and(succeeded(), eq(dependencies.decide.outputs['out.runS3'], 'true'))
+    pool:
+      vmImage: ubuntu-latest   # if you have a self-hosted EC2 agent pool, put its name here
+    steps:
+    - checkout: self
+
+    - script: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y curl unzip jq
+
+        # Install Terraform
+        curl -fsSL "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip" -o tf.zip
+        sudo unzip -o tf.zip -d /usr/local/bin
+        rm tf.zip
+        terraform -version
+
+        # Skip if no *.tf files
+        if [ ! -d s3 ] || ! ls s3/*.tf >/dev/null 2>&1; then
+          echo "No Terraform files under s3/. Skipping."
+          exit 0
+        fi
+
+        export AWS_DEFAULT_REGION="$(awsRegion)"
+        HAVE_CREDS="no"
+        if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+          HAVE_CREDS="yes"
+        elif [ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && [ -n "${AWS_ROLE_ARN:-}" ]; then
+          HAVE_CREDS="yes"
+        elif curl -fsS --max-time 1 http://169.254.169.254/latest/meta-data/iam/security-credentials/ >/dev/null 2>&1; then
+          HAVE_CREDS="yes"
+        fi
+        if [ "$HAVE_CREDS" != "yes" ]; then
+          echo "ERROR: No AWS credentials available for Terraform."
+          echo "Fix by EITHER: (1) run on a self-hosted EC2 agent with an IAM role, (2) set AWS_* variables in the pipeline, or (3) install AWS Toolkit and use a service connection."
+          exit 1
+        fi
+
+        cd s3
+        terraform fmt -check -recursive
+        terraform init -input=false
+        terraform validate -no-color
+        terraform plan -input=false -no-color -out=tfplan
+        terraform show -no-color tfplan > tfplan.txt
+
+        mkdir -p "$(Build.ArtifactStagingDirectory)/s3"
+        cp tfplan tfplan.txt "$(Build.ArtifactStagingDirectory)/s3/"
+
+        echo "##vso[task.addattachment type=Distributedtask.Core.Summary;name=S3 Terraform Plan;]$(Build.ArtifactStagingDirectory)/s3/tfplan.txt"
+      displayName: Terraform plan (s3)
+
+    - publish: $(Build.ArtifactStagingDirectory)/s3
+      artifact: s3-tfplan
