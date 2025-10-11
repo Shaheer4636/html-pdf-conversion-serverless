@@ -16,7 +16,6 @@ provider "aws" {
   region = var.region
 }
 
-# ---- Unique name handling (prefix + optional random suffix)
 resource "random_id" "suffix" {
   count       = var.add_random_suffix ? 1 : 0
   byte_length = 2
