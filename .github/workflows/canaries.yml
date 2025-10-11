@@ -1,0 +1,119 @@
+name: terraform-synthetics-canary
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "canary/**"
+      - ".github/workflows/terraform-synthetics-canary.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "canary/**"
+      - ".github/workflows/terraform-synthetics-canary.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.6.6"
+  WORKDIR: canary
+  AWS_REGION: "us-east-1"
+  TFVARS_FILE: "sandbox.tfvars"
+  TF_IN_AUTOMATION: "1"
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
+      SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate repo variables
+        run: |
+          set -euo pipefail
+          [ -n "${AKI:-}" ] || { echo "Missing repo variable AWS_ACCESS_KEY_ID"; exit 1; }
+          [ -n "${SAK:-}" ] || { echo "Missing repo variable AWS_SECRET_ACCESS_KEY"; exit 1; }
+          [ -n "${AWS_REGION:-}" ] || { echo "Missing AWS_REGION (env or Variable)"; exit 1; }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ env.AKI }}
+          aws-secret-access-key: ${{ env.SAK }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt (check)
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: Terraform plan
+        run: |
+          [ -f "${TFVARS_FILE}" ] || { echo "Missing ${TFVARS_FILE} in ${WORKDIR}"; exit 1; }
+          terraform plan -input=false -no-color -out=tfplan -var-file="${TFVARS_FILE}"
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKDIR }}/tfplan
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      AKI: ${{ vars.AWS_ACCESS_KEY_ID }}
+      SAK: ${{ vars.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate repo variables
+        run: |
+          set -euo pipefail
+          [ -n "${AKI:-}" ] || { echo "Missing repo variable AWS_ACCESS_KEY_ID"; exit 1; }
+          [ -n "${SAK:-}" ] || { echo "Missing repo variable AWS_SECRET_ACCESS_KEY"; exit 1; }
+          [ -n "${AWS_REGION:-}" ] || { echo "Missing AWS_REGION (env or Variable)"; exit 1; }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ env.AKI }}
+          aws-secret-access-key: ${{ env.SAK }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: Terraform plan (for logs)
+        run: |
+          [ -f "${TFVARS_FILE}" ] || { echo "Missing ${TFVARS_FILE} in ${WORKDIR}"; exit 1; }
+          terraform plan -input=false -no-color -out=tfplan -var-file="${TFVARS_FILE}"
+        working-directory: ${{ env.WORKDIR }}
+
+      - name: Terraform apply
+        run: terraform apply -input=false -auto-approve -var-file="${TFVARS_FILE}"
+        working-directory: ${{ env.WORKDIR }}
