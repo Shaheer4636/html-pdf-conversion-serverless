@@ -16,29 +16,54 @@ provider "aws" {
   region = var.region
 }
 
+data "aws_caller_identity" "this" {}
+data "aws_partition" "this" {}
 
-resource "aws_s3_bucket" "artifacts" {
-  bucket = var.artifacts_bucket_name
+# --------------------------------------------
+# Canary script packaged into a ZIP
+# (No Terraform interpolation inside; no `${}` backticks used.)
+# --------------------------------------------
+locals {
+  canary_code = <<-JS
+    const synthetics = require('Synthetics');
+    const log = require('SyntheticsLogger');
+
+    const canaryTest = async function () {
+      const url = process.env.TARGET_URL;
+      if (!url) { throw new Error("TARGET_URL is not set"); }
+
+      const page = await synthetics.getPage();
+      const resp = await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      const status = resp ? resp.status() : 0;
+      log.info("Loaded " + url + " with status " + status);
+
+      if (status < 200 || status > 399) {
+        throw new Error("Non-OK HTTP status: " + status);
+      }
+
+      await synthetics.takeScreenshot('loaded', 'after_load');
+      const title = await page.title();
+      if (!title || !title.trim()) {
+        throw new Error("Page title is empty");
+      }
+    };
+
+    exports.handler = async () => {
+      return await canaryTest();
+    };
+  JS
 }
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
-  bucket = aws_s3_bucket.artifacts.id
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
+data "archive_file" "canary_zip" {
+  type                        = "zip"
+  source_content              = local.canary_code
+  source_content_filename     = "index.js"
+  output_path                 = "${path.module}/canary.zip"
 }
 
-resource "aws_s3_bucket_public_access_block" "artifacts" {
-  bucket                  = aws_s3_bucket.artifacts.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-
+# --------------------------------------------
+# IAM Role for the Canary (exact name via var)
+# --------------------------------------------
 resource "aws_iam_role" "synthetics_role" {
   name = var.synthetics_role_name
 
@@ -59,21 +84,24 @@ resource "aws_iam_role" "synthetics_role" {
   })
 }
 
-# Policy granting CloudWatch Logs, Metrics, and S3 write to your artifacts bucket
+# Inline policy: logs, metrics, and write to your artifacts bucket
 data "aws_iam_policy_document" "synthetics_inline" {
+  # CloudWatch Logs
   statement {
-    sid     = "Logs"
+    sid     = "LogsAccess"
     effect  = "Allow"
     actions = [
       "logs:CreateLogGroup",
       "logs:CreateLogStream",
-      "logs:PutLogEvents"
+      "logs:PutLogEvents",
+      "logs:DescribeLogStreams"
     ]
-    resources = ["arn:aws:logs:${var.region}:${data.aws_caller_identity.this.account_id}:log-group:/aws/lambda/cwsyn-*:*"]
+    resources = ["*"]
   }
 
+  # CloudWatch custom metrics
   statement {
-    sid     = "Metrics"
+    sid     = "PutCWMetrics"
     effect  = "Allow"
     actions = ["cloudwatch:PutMetricData"]
     resources = ["*"]
@@ -84,17 +112,19 @@ data "aws_iam_policy_document" "synthetics_inline" {
     }
   }
 
+  # S3 artifacts (bucket you provided; we don't create it)
   statement {
-    sid     = "S3WriteArtifacts"
+    sid     = "S3ArtifactsWrite"
     effect  = "Allow"
     actions = [
       "s3:PutObject",
-      "s3:GetBucketLocation",
-      "s3:ListBucket"
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:GetBucketLocation"
     ]
     resources = [
-      aws_s3_bucket.artifacts.arn,
-      "${aws_s3_bucket.artifacts.arn}/*"
+      "arn:${data.aws_partition.this.partition}:s3:::${var.artifacts_bucket_name}",
+      "arn:${data.aws_partition.this.partition}:s3:::${var.artifacts_bucket_name}/*"
     ]
   }
 }
@@ -105,63 +135,18 @@ resource "aws_iam_role_policy" "synthetics_inline" {
   policy = data.aws_iam_policy_document.synthetics_inline.json
 }
 
-data "aws_caller_identity" "this" {}
-
-
-# Minimal heartbeat that loads the URL and asserts 2xx/3xx status.
-# Uses TARGET_URL as env var.
-locals {
-  canary_code = <<'JS'
-const synthetics = require('Synthetics');
-const log = require('SyntheticsLogger');
-
-const canaryTest = async function () {
-  const url = process.env.TARGET_URL;
-  if (!url) throw new Error("TARGET_URL is not set");
-
-  const page = await synthetics.getPage();
-
-  // Navigate and wait for network to be idle
-  const resp = await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-  const status = resp ? resp.status() : 0;
-  log.info(`Loaded ${url} with status ${status}`);
-
-  if (status < 200 || status > 399) {
-    throw new Error(`Non-OK HTTP status: ${status}`);
-  }
-
-  await synthetics.takeScreenshot('loaded', 'after_load');
-  // Simple content sanity: page has a title
-  const title = await page.title();
-  if (!title || !title.trim()) {
-    throw new Error("Page title is empty");
-  }
-};
-
-exports.handler = async () => {
-  return await canaryTest();
-};
-JS
-}
-
-data "archive_file" "canary_zip" {
-  type                        = "zip"
-  source_content              = local.canary_code
-  source_content_filename     = "index.js"
-  output_path                 = "${path.module}/canary.zip"
-}
-
-
+# --------------------------------------------
+# CloudWatch Synthetics Canary (runs every minute)
+# --------------------------------------------
 resource "aws_synthetics_canary" "this" {
   name                 = var.canary_name
-  artifact_s3_location = "s3://${aws_s3_bucket.artifacts.bucket}/${var.canary_name}/"
+  artifact_s3_location = "s3://${var.artifacts_bucket_name}/${var.canary_name}/"
   execution_role_arn   = aws_iam_role.synthetics_role.arn
   runtime_version      = var.runtime_version
-  handler              = "index.handler"
   start_canary         = var.start_canary
 
   schedule {
-    expression = "rate(1 minute)"
+    expression          = "rate(1 minute)"
     duration_in_seconds = 0
   }
 
@@ -175,16 +160,19 @@ resource "aws_synthetics_canary" "this" {
   success_retention_period = var.success_retention_days
   failure_retention_period = var.failure_retention_days
 
-  depends_on = [
-    aws_iam_role_policy.synthetics_inline
-  ]
+  code {
+    handler  = "index.handler"
+    # Read the zip we just wrote
+    zip_file = filebase64("${path.module}/canary.zip")
+  }
+
+  depends_on = [aws_iam_role_policy.synthetics_inline]
 }
 
-# Optional: Output useful values
 output "canary_name" {
   value = aws_synthetics_canary.this.name
 }
 
 output "artifacts_prefix" {
-  value = "s3://${aws_s3_bucket.artifacts.bucket}/${var.canary_name}/"
+  value = "s3://${var.artifacts_bucket_name}/${var.canary_name}/"
 }
