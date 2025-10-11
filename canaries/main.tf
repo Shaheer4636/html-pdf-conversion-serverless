@@ -19,7 +19,6 @@ provider "aws" {
 data "aws_caller_identity" "this" {}
 data "aws_partition" "this" {}
 
-# --------------------------------------------
 # Canary script packaged into a ZIP
 # --------------------------------------------
 locals {
