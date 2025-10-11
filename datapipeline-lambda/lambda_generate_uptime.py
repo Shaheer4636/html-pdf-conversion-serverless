@@ -1,3 +1,38 @@
+# --- .env loader (no external deps) ---------------------------------
+import os, shlex
+
+def load_env_file(path: str = ".env", override: bool = False) -> None:
+    """
+    Minimal .env parser:
+      - Ignores blank lines and lines starting with '#'
+      - Accepts KEY=VALUE (VALUE may be quoted)
+      - If override=False, existing os.environ values win
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            # Parse value with shlex so quoted strings work
+            try:
+                val = shlex.split(val, comments=False, posix=True)
+                val = val[0] if val else ""
+            except Exception:
+                val = val.strip().strip('\'"')
+            if override or key not in os.environ:
+                os.environ[key] = val
+
+# Load .env before reading any settings
+load_env_file(".env", override=False)
+# --------------------------------------------------------------------
+
+
 # === CONFIG VIA ENV
 import os
 ART_BUCKET     = os.getenv("ART_BUCKET", "change-me")
