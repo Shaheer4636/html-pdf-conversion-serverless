@@ -19,10 +19,10 @@ provider "aws" {
 data "aws_caller_identity" "this" {}
 data "aws_partition" "this" {}
 
-# Canary script packaged into a ZIP
+# --------------------------------------------
+# Canary script packaged into a ZIP (in-memory)
 # --------------------------------------------
 locals {
-  # Keep JS simple; no `${}` template strings to avoid escaping in HCL
   canary_code = <<-JS
     const synthetics = require('Synthetics');
     const log = require('SyntheticsLogger');
@@ -54,10 +54,10 @@ locals {
 }
 
 data "archive_file" "canary_zip" {
-  type                        = "zip"
-  source_content              = local.canary_code
-  source_content_filename     = "index.js"
-  output_path                 = "${path.module}/canary.zip"
+  type                    = "zip"
+  source_content          = local.canary_code
+  source_content_filename = "index.js"
+  # no output_path -> keep it purely in memory for plan/apply
 }
 
 # --------------------------------------------
@@ -70,20 +70,14 @@ resource "aws_iam_role" "synthetics_role" {
     Version = "2012-10-17",
     Statement = [
       {
-        Effect = "Allow",
-        Principal = {
-          Service = [
-            "lambda.amazonaws.com",
-            "synthetics.amazonaws.com"
-          ]
-        },
-        Action = "sts:AssumeRole"
+        Effect   = "Allow",
+        Principal = { Service = ["lambda.amazonaws.com", "synthetics.amazonaws.com"] },
+        Action   = "sts:AssumeRole"
       }
     ]
   })
 }
 
-# Inline policy: logs, metrics, and write to your artifacts bucket
 data "aws_iam_policy_document" "synthetics_inline" {
   statement {
     sid     = "LogsAccess"
@@ -132,16 +126,16 @@ resource "aws_iam_role_policy" "synthetics_inline" {
 }
 
 # --------------------------------------------
-# CloudWatch Synthetics Canary (runs every minute)
-# NOTE: handler and zip_file are TOP-LEVEL args (no code{} block)
+# CloudWatch Synthetics Canary (every minute)
 # --------------------------------------------
 resource "aws_synthetics_canary" "this" {
   name                 = var.canary_name
   artifact_s3_location = "s3://${var.artifacts_bucket_name}/${var.canary_name}/"
   execution_role_arn   = aws_iam_role.synthetics_role.arn
   runtime_version      = var.runtime_version
-  handler              = "index.handler"                          # required top-level arg
-  zip_file             = filebase64("${path.module}/canary.zip")  # required top-level arg
+  handler              = "index.handler"
+  # FIX: use the archive_file data source output, not filebase64(...)
+  zip_file             = data.archive_file.canary_zip.output_base64
   start_canary         = var.start_canary
 
   schedule {
