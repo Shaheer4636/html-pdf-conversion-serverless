@@ -4,8 +4,8 @@ on:
   push:
     branches: [ "main" ]
     paths:
-      - "canaries/**"
-      - ".github/workflows/terraform-synthetics-canary.yml"
+      # - "canaries/**"
+      # - ".github/workflows/terraform-synthetics-canary.yml"
   pull_request:
     branches: [ "main" ]
     paths:
