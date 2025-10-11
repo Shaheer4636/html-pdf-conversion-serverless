@@ -1,5 +1,5 @@
 region             = "us-east-1"
-name_prefix        = "citi-uat"
+name_prefix        = "citi-uat-1"
 add_random_suffix  = true
 
 canary_bucket_name = "synthetics-artifacts"
