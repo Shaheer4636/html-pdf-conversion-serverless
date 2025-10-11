@@ -15,30 +15,29 @@ variable "target_url" {
 }
 
 variable "artifacts_bucket_name" {
-  description = "S3 bucket to store Synthetics artifacts"
+  description = "Existing S3 bucket where Synthetics artifacts are stored"
   type        = string
 }
 
 variable "synthetics_role_name" {
-  description = "IAM role name for the Synthetics canary execution"
+  description = "IAM role name for the canary execution"
   type        = string
 }
 
 variable "runtime_version" {
-  description = "Synthetics runtime version (Node.js + Puppeteer)"
+  description = "Synthetics runtime version"
   type        = string
-  # You can change if your account supports a newer version.
   default     = "syn-nodejs-puppeteer-6.2"
 }
 
 variable "start_canary" {
-  description = "Whether to start the canary after create/update"
+  description = "Start the canary after create/update"
   type        = bool
   default     = true
 }
 
 variable "timeout_seconds" {
-  description = "Run timeout per check"
+  description = "Per-run timeout"
   type        = number
   default     = 60
 }
