@@ -9,7 +9,7 @@ on:
   pull_request:
     branches: [ "main" ]
     paths:
-      - "canary/**"
+      - "canaries/**"
       - ".github/workflows/terraform-synthetics-canary.yml"
   workflow_dispatch: {}
 
@@ -18,9 +18,9 @@ permissions:
 
 env:
   TF_VERSION: "1.6.6"
-  WORKDIR: canary
+  WORKDIR: canaries
   AWS_REGION: "us-east-1"
-  TFVARS_FILE: "sandbox.tfvars"
+  TFVARS_FILE: "sandbox.tfvars"   # change if your file name differs
   TF_IN_AUTOMATION: "1"
 
 jobs:
@@ -47,31 +47,32 @@ jobs:
           aws-secret-access-key: ${{ env.SAK }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Terraform fmt (check)
-        run: terraform fmt -check -recursive
-        working-directory: ${{ env.WORKDIR }}
-
-      - name: Terraform init
-        run: terraform init -input=false
-        working-directory: ${{ env.WORKDIR }}
-
-      - name: Terraform validate
-        run: terraform validate -no-color
-        working-directory: ${{ env.WORKDIR }}
-
-      - name: Terraform plan
+      - name: Sanity check folder & files
         run: |
-          [ -f "${TFVARS_FILE}" ] || { echo "Missing ${TFVARS_FILE} in ${WORKDIR}"; exit 1; }
-          terraform plan -input=false -no-color -out=tfplan -var-file="${TFVARS_FILE}"
+          set -euo pipefail
+          ls -la
+          ls -la "${WORKDIR}"
+          [ -f "${WORKDIR}/main.tf" ] || { echo "main.tf missing under ${WORKDIR}"; exit 1; }
+          [ -f "${WORKDIR}/variables.tf" ] || { echo "variables.tf missing under ${WORKDIR}"; exit 1; }
+          [ -f "${WORKDIR}/${TFVARS_FILE}" ] || { echo "${TFVARS_FILE} missing under ${WORKDIR}"; exit 1; }
+
+      - run: terraform fmt -check -recursive
         working-directory: ${{ env.WORKDIR }}
 
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
+      - run: terraform init -input=false
+        working-directory: ${{ env.WORKDIR }}
+
+      - run: terraform validate -no-color
+        working-directory: ${{ env.WORKDIR }}
+
+      - run: terraform plan -input=false -no-color -out=tfplan -var-file="${TFVARS_FILE}"
+        working-directory: ${{ env.WORKDIR }}
+
+      - uses: actions/upload-artifact@v4
         with:
           name: tfplan
           path: ${{ env.WORKDIR }}/tfplan
@@ -99,21 +100,23 @@ jobs:
           aws-secret-access-key: ${{ env.SAK }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
-      - name: Terraform init
-        run: terraform init -input=false
-        working-directory: ${{ env.WORKDIR }}
-
-      - name: Terraform plan (for logs)
+      - name: Sanity check folder & files
         run: |
-          [ -f "${TFVARS_FILE}" ] || { echo "Missing ${TFVARS_FILE} in ${WORKDIR}"; exit 1; }
-          terraform plan -input=false -no-color -out=tfplan -var-file="${TFVARS_FILE}"
+          set -euo pipefail
+          ls -la "${WORKDIR}"
+          [ -f "${WORKDIR}/main.tf" ] || { echo "main.tf missing under ${WORKDIR}"; exit 1; }
+          [ -f "${WORKDIR}/variables.tf" ] || { echo "variables.tf missing under ${WORKDIR}"; exit 1; }
+          [ -f "${WORKDIR}/${TFVARS_FILE}" ] || { echo "${TFVARS_FILE} missing under ${WORKDIR}"; exit 1; }
+
+      - run: terraform init -input=false
         working-directory: ${{ env.WORKDIR }}
 
-      - name: Terraform apply
-        run: terraform apply -input=false -auto-approve -var-file="${TFVARS_FILE}"
+      - run: terraform plan -input=false -no-color -out=tfplan -var-file="${TFVARS_FILE}"
+        working-directory: ${{ env.WORKDIR }}
+
+      - run: terraform apply -input=false -auto-approve -var-file="${TFVARS_FILE}"
         working-directory: ${{ env.WORKDIR }}
