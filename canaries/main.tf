@@ -21,9 +21,9 @@ data "aws_partition" "this" {}
 
 # --------------------------------------------
 # Canary script packaged into a ZIP
-# (No Terraform interpolation inside; no `${}` backticks used.)
 # --------------------------------------------
 locals {
+  # Keep JS simple; no `${}` template strings to avoid escaping in HCL
   canary_code = <<-JS
     const synthetics = require('Synthetics');
     const log = require('SyntheticsLogger');
@@ -86,7 +86,6 @@ resource "aws_iam_role" "synthetics_role" {
 
 # Inline policy: logs, metrics, and write to your artifacts bucket
 data "aws_iam_policy_document" "synthetics_inline" {
-  # CloudWatch Logs
   statement {
     sid     = "LogsAccess"
     effect  = "Allow"
@@ -99,7 +98,6 @@ data "aws_iam_policy_document" "synthetics_inline" {
     resources = ["*"]
   }
 
-  # CloudWatch custom metrics
   statement {
     sid     = "PutCWMetrics"
     effect  = "Allow"
@@ -112,7 +110,6 @@ data "aws_iam_policy_document" "synthetics_inline" {
     }
   }
 
-  # S3 artifacts (bucket you provided; we don't create it)
   statement {
     sid     = "S3ArtifactsWrite"
     effect  = "Allow"
@@ -137,12 +134,15 @@ resource "aws_iam_role_policy" "synthetics_inline" {
 
 # --------------------------------------------
 # CloudWatch Synthetics Canary (runs every minute)
+# NOTE: handler and zip_file are TOP-LEVEL args (no code{} block)
 # --------------------------------------------
 resource "aws_synthetics_canary" "this" {
   name                 = var.canary_name
   artifact_s3_location = "s3://${var.artifacts_bucket_name}/${var.canary_name}/"
   execution_role_arn   = aws_iam_role.synthetics_role.arn
   runtime_version      = var.runtime_version
+  handler              = "index.handler"                          # required top-level arg
+  zip_file             = filebase64("${path.module}/canary.zip")  # required top-level arg
   start_canary         = var.start_canary
 
   schedule {
@@ -159,12 +159,6 @@ resource "aws_synthetics_canary" "this" {
 
   success_retention_period = var.success_retention_days
   failure_retention_period = var.failure_retention_days
-
-  code {
-    handler  = "index.handler"
-    # Read the zip we just wrote
-    zip_file = filebase64("${path.module}/canary.zip")
-  }
 
   depends_on = [aws_iam_role_policy.synthetics_inline]
 }
