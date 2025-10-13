@@ -1,5 +1,7 @@
 name: Build & Deploy Lambda (Container)
 
+#build&deploy
+
 on:
   push:
     branches: [ "main" ]
@@ -19,8 +21,8 @@ env:
   LAMBDA_EPHEMERAL: "1024"
 
   # App env vars passed to Lambda
-  SRC_BUCKET: lambda-output-report-000000987123
-  DEST_BUCKET: pdf-uptime-reports-0000009
+  SRC_BUCKET: lambda1-output-009 # source html bucket
+  DEST_BUCKET: pdf-uptime-reports-00000009 # expected pdf bucket
   BASE_PREFIX: uptime
   ALLOW_PDF_SKIP: "false"
   PLAYWRIGHT_WAIT: domcontentloaded   # ignored by wkhtmltopdf (kept for compatibility)
