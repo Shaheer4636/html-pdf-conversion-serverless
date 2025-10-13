@@ -4,7 +4,7 @@ from botocore.exceptions import ClientError
 
 # ---- Env (kept same keys you already use) ----
 SRC_BUCKET  = os.environ.get("SRC_BUCKET",  "lambda1-output-009")
-DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-0000009")
+DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-00000009")
 BASE_PREFIX = os.environ.get("BASE_PREFIX", "uptime")
 PDF_FORMAT  = os.environ.get("PDF_FORMAT",  "A4")
 JS_DELAY_MS = int(os.environ.get("JS_DELAY_MS", "5000"))  # give JS time to paint
