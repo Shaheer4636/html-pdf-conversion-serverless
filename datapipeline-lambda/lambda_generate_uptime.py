@@ -1,54 +1,23 @@
-# --- .env loader (no external deps) ---------------------------------
-import os, shlex
+# === STATIC CONFIG (no .env, no getenv) =============================
+# S3 sources (artifacts written by the canaries)
+ART_BUCKET     = "canary-output-0009"   # <-- set your exact bucket
+ART_PREFIX     = "canary/us-east-1/situs-amc"         # <-- set your exact prefix (no trailing slash)
 
-def load_env_file(path: str = ".env", override: bool = False) -> None:
-    """
-    Minimal .env parser:
-      - Ignores blank lines and lines starting with '#'
-      - Accepts KEY=VALUE (VALUE may be quoted)
-      - If override=False, existing os.environ values win
-    """
-    if not os.path.exists(path):
-        return
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            key = key.strip()
-            # Parse value with shlex so quoted strings work
-            try:
-                val = shlex.split(val, comments=False, posix=True)
-                val = val[0] if val else ""
-            except Exception:
-                val = val.strip().strip('\'"')
-            if override or key not in os.environ:
-                os.environ[key] = val
+# S3 targets (where this Lambda writes CSV/HTML reports)
+REPORTS_BUCKET = "lambda1-output-009"                    # <-- set your exact bucket
+REPORTS_PREFIX = "uptime"                               # folder/prefix inside REPORTS_BUCKET (no leading/trailing slash)
 
-# Load .env before reading any settings
-load_env_file(".env", override=False)
-# --------------------------------------------------------------------
+# Report identity
+COMPANY        = "Situs-AMC"
+SERVICE        = "Useful App"
+CLIENT         = "CitiBank"
 
-
-# === CONFIG VIA ENV
-import os
-ART_BUCKET     = os.getenv("ART_BUCKET", "change-me")
-ART_PREFIX     = os.getenv("ART_PREFIX", "canary/us-east-1/your-prefix")
-REPORTS_BUCKET = os.getenv("REPORTS_BUCKET", "change-me")
-REPORTS_PREFIX = os.getenv("REPORTS_PREFIX", "uptime")
-
-COMPANY        = os.getenv("COMPANY", "Situs-AMC")
-SERVICE        = os.getenv("SERVICE", "Useful App")
-CLIENT         = os.getenv("CLIENT", "CitiBank")
-
-ONLY_BROWSER   = os.getenv("ONLY_BROWSER", "ANY")
-FAIL_STREAK    = int(os.getenv("FAIL_STREAK", "3"))
-TREAT_MISSING  = os.getenv("TREAT_MISSING", "false").lower() == "true"
-SLO_TARGET     = os.getenv("SLO_TARGET", "auto")
-# ======================
+# Behavior
+ONLY_BROWSER   = "ANY"      # "ANY" or an exact browser label that appears in your S3 keys (e.g., "CHROME")
+FAIL_STREAK    = 3          # minutes in a row to call it an incident
+TREAT_MISSING  = False      # True = missing minutes count as failures
+SLO_TARGET     = "auto"     # "auto" or a number like "99.900"
+# ===================================================================
 
 import os, json, re, csv, io, datetime, random
 from datetime import timezone, timedelta
@@ -79,10 +48,11 @@ def month_window_utc(now: Optional[datetime.datetime]=None) -> Tuple[datetime.da
 def _num_or_null(v: Optional[float]) -> str:
     return "null" if (v is None) else f"{float(v):.3f}"
 
-# Compile path pattern once
+# Compile path pattern once — use ART_PREFIX exactly as defined above
+_PAT_PREFIX = ART_PREFIX.rstrip("/")
 PAT_ANY = re.compile(
     r"^%s/(?P<y>\d{4})/(?P<m>\d{2})/(?P<d>\d{2})/(?P<h>\d{2})/(?P<min>\d{2})-(?P<s>\d{2})-(?P<ms>\d{3})(?:/(?P<br>[^/]+))?/(?P<file>[^/]+)$"
-    % re.escape(ART_PREFIX.rstrip("/"))
+    % re.escape(_PAT_PREFIX)
 )
 
 # -------------------------- Parsers ---------------------------------
@@ -635,6 +605,10 @@ def _put_csv(bucket: str, key: str, rows: List[Dict[str, Any]], cols: List[str])
 
 # --------------------------- Handler --------------------------------
 def handler(event, context):
+    # quick sanity to avoid silent misconfigs
+    if not ART_BUCKET or not REPORTS_BUCKET:
+        raise ValueError(f"ART_BUCKET/REPORTS_BUCKET must be set: ART_BUCKET={repr(ART_BUCKET)}, REPORTS_BUCKET={repr(REPORTS_BUCKET)}")
+
     now = _now_utc()
     start_m, end_m = month_window_utc(now)
     y = start_m.year; mo = start_m.month
@@ -683,7 +657,7 @@ def handler(event, context):
              ["day_utc","cumulative_availability_pct","cumulative_avg_response_sec"])
 
     # SLO (auto or fixed)
-    slo_val = float(SLO_TARGET) if isinstance(SLO_TARGET, (int,float)) or (isinstance(SLO_TARGET,str) and SLO_TARGET.replace('.','',1).isdigit()) else compute_slo_auto(now)
+    slo_val = float(SLO_TARGET) if (isinstance(SLO_TARGET, (int,float)) or (isinstance(SLO_TARGET,str) and SLO_TARGET.replace('.','',1).isdigit())) else compute_slo_auto(now)
 
     # YTD summary
     try:
