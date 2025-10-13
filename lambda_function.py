@@ -2,20 +2,24 @@ import os, json, boto3, pdfkit
 from datetime import datetime
 from botocore.exceptions import ClientError
 
-# ---- Env (kept same keys you already use) ----
-SRC_BUCKET  = os.environ.get("SRC_BUCKET",  "lambda1-output-009")
-DEST_BUCKET = os.environ.get("DEST_BUCKET", "pdf-uptime-reports-00000009")
-BASE_PREFIX = os.environ.get("BASE_PREFIX", "uptime")
-PDF_FORMAT  = os.environ.get("PDF_FORMAT",  "A4")
-JS_DELAY_MS = int(os.environ.get("JS_DELAY_MS", "5000"))  # give JS time to paint
-WKHTMLTOPDF_BIN = os.environ.get("WKHTMLTOPDF_BIN", "/usr/bin/wkhtmltopdf")  # from Ubuntu package
+# ===== Hard-coded identifiers (edit these three lines to your actual values) =====
+LAMBDA_ARN     = "arn:aws:lambda:us-east-1:492046385895:function:uptime-report-pdf"
+SRC_BUCKET     = "lambda1-output-009"
+DEST_BUCKET    = "pdf-uptime-reports-00000009"
+# =================================================================================
 
+BASE_PREFIX      = "uptime"
+PDF_FORMAT       = "A4"
+JS_DELAY_MS      = 5000                      # ms to let JS render
+WKHTMLTOPDF_BIN  = "/usr/bin/wkhtmltopdf"    # wkhtmltopdf path in your layer/image
 
+# Lambda tmp-friendly defaults
 os.environ.setdefault("HOME", "/tmp")
 os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 os.environ.setdefault("FONTCONFIG_PATH", "/etc/fonts")
 
 s3 = boto3.client("s3")
+sts = boto3.client("sts")
 
 def _ym(event: dict):
     now = datetime.utcnow()
@@ -23,7 +27,7 @@ def _ym(event: dict):
     m = str(event.get("month") or now.month).zfill(2)
     return y, m
 
-def _key(y, m, name): 
+def _key(y, m, name):
     return f"{BASE_PREFIX}/{y}/{m}/{name}".lstrip("/")
 
 def lambda_handler(event, context=None):
@@ -33,27 +37,47 @@ def lambda_handler(event, context=None):
     html_key = event.get("html_key") or _key(year, month, "uptime-report.html")
     pdf_key  = event.get("pdf_key")  or _key(year, month, "uptime-report.pdf")
 
+    # Diagnostics in CloudWatch logs
+    runtime_arn = getattr(context, "invoked_function_arn", "<no-context>")
+    try:
+        ident = sts.get_caller_identity()
+        print("CALLER_STS:", json.dumps(ident))
+    except Exception as _e:
+        print("CALLER_STS: <failed>", str(_e))
+    print(f"HARDCODED_LAMBDA_ARN={LAMBDA_ARN}")
+    print(f"RUNTIME_LAMBDA_ARN={runtime_arn}")
+    print(f"Read HTML  : s3://{SRC_BUCKET}/{html_key}")
+    print(f"Write PDF  : s3://{DEST_BUCKET}/{pdf_key}")
+
     # 1) fetch HTML
     try:
         obj = s3.get_object(Bucket=SRC_BUCKET, Key=html_key)
         html = obj["Body"].read().decode("utf-8", errors="ignore")
     except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        status = 403 if code in ("AccessDenied", "403", "Unauthorized") else 404
         return {
-            "statusCode": 404,
-            "headers": {"Content-Type":"application/json"},
-            "body": json.dumps({"error": f"Missing {SRC_BUCKET}/{html_key}", "detail": str(e)})
+            "statusCode": status,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": f"S3 {code} for {SRC_BUCKET}/{html_key}",
+                "detail": str(e),
+                "lambda_arn_hardcoded": LAMBDA_ARN,
+                "lambda_arn_runtime": runtime_arn
+            })
         }
 
-    # 2) copy HTML to dest for debugging (non-fatal if it fails)
+    # 2) copy HTML to dest for debugging (best-effort)
     try:
         s3.copy_object(
             CopySource={"Bucket": SRC_BUCKET, "Key": html_key},
-            Bucket=DEST_BUCKET, Key=html_key,
+            Bucket=DEST_BUCKET,
+            Key=html_key,
             MetadataDirective="REPLACE",
             ContentType="text/html; charset=utf-8"
         )
-    except ClientError:
-        pass
+    except ClientError as e:
+        print("copy_object failed (non-fatal):", str(e))
 
     # 3) render to PDF with wkhtmltopdf
     config = pdfkit.configuration(wkhtmltopdf=WKHTMLTOPDF_BIN)
@@ -66,12 +90,9 @@ def lambda_handler(event, context=None):
         "margin-right": "0mm",
         "margin-bottom": "0mm",
         "margin-left": "0mm",
-        # JS render time (increase if charts still blank)
         "javascript-delay": str(JS_DELAY_MS),
-        # Helpful if your page uses heavy JS:
-        # "no-stop-slow-scripts": None,
-        # If your HTML sets window.status='done' when finished:
         # "window-status": "done",
+        # "no-stop-slow-scripts": None,
         # "debug-javascript": None,
         # "log-level": "warn",
     }
@@ -79,25 +100,38 @@ def lambda_handler(event, context=None):
     try:
         pdf_bytes = pdfkit.from_string(html, False, options=options, configuration=config)
     except OSError as e:
-        # Common cause: missing wkhtmltopdf or bad path
         return {
             "statusCode": 500,
-            "headers": {"Content-Type":"application/json"},
+            "headers": {"Content-Type": "application/json"},
             "body": json.dumps({"error": f"wkhtmltopdf error: {e}"})
         }
 
     # 4) upload PDF
-    s3.put_object(
-        Bucket=DEST_BUCKET,
-        Key=pdf_key,
-        Body=pdf_bytes,
-        ContentType="application/pdf",
-    )
+    try:
+        s3.put_object(
+            Bucket=DEST_BUCKET,
+            Key=pdf_key,
+            Body=pdf_bytes,
+            ContentType="application/pdf",
+        )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        return {
+            "statusCode": 403 if code in ("AccessDenied", "403", "Unauthorized") else 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": f"S3 {code} on put {DEST_BUCKET}/{pdf_key}",
+                "detail": str(e),
+                "lambda_arn_hardcoded": LAMBDA_ARN,
+                "lambda_arn_runtime": runtime_arn
+            })
+        }
 
     return {
         "statusCode": 200,
-        "headers": {"Content-Type":"application/json"},
+        "headers": {"Content-Type": "application/json"},
         "body": json.dumps({
+            "lambda_arn": LAMBDA_ARN,
             "src_bucket": SRC_BUCKET,
             "dest_bucket": DEST_BUCKET,
             "prefix": f"{BASE_PREFIX}/{year}/{month}/",
